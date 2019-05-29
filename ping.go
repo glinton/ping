@@ -38,6 +38,13 @@ func (p *pktMap) Store(key string, val packetInfo) {
 	p.tex.Unlock()
 }
 
+// Delete deletes packetInfo from pktMap in a thread safe manner.
+func (p *pktMap) Delete(key string) {
+	p.tex.Lock()
+	delete(p.data, key)
+	p.tex.Unlock()
+}
+
 // Load returns packetInfo from pktMap in a thread safe manner.
 func (p *pktMap) Load(key string) (packetInfo, bool) {
 	p.tex.Lock()
@@ -94,8 +101,10 @@ func (p *pktMap) Packets() (int, int) {
 // unique settings per each, or you may have one Pinger for multiple hosts you desire
 // to ping, with the same settings for each host.
 type Pinger struct {
-	wg  *sync.WaitGroup
-	ctx context.Context
+	wg       *sync.WaitGroup
+	sendTex  *sync.Mutex
+	ctx      context.Context
+	finished chan packetInfo
 
 	proto       int    // iana icmp protocol
 	packetsRcvd pktMap // packetsRcvd contains the aggregated stats for packets received.
@@ -137,6 +146,7 @@ type Packet struct {
 }
 
 type packetInfo struct {
+	ip          string             // ping destination
 	sentAt      map[uint]time.Time // records the time the ping was sent
 	packetsSent uint               // tallies the number of packet's sent
 	packetsRcvd uint               // tallies the number of packet's received
@@ -199,7 +209,7 @@ func WithTimeout(d time.Duration) func(*Pinger) {
 	}
 }
 
-// WithDeadline allows setting the total ping timeout per host. Default is no timeout (0).
+// WithDeadline allows setting the total ping timeout per host. Default is 10 seconds.
 func WithDeadline(d time.Duration) func(*Pinger) {
 	return func(p *Pinger) {
 		p.deadline = d
@@ -217,9 +227,11 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 		size:        56,
 		interval:    time.Second,
 		timeout:     time.Second * 5,
+		deadline:    time.Second * 10,
 		wg:          &sync.WaitGroup{},
 		packetsSent: pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)},
 		packetsRcvd: pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)},
+		sendTex:     &sync.Mutex{},
 	}
 
 	for i := range opts {
@@ -230,6 +242,10 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 		p.interval = time.Millisecond * 200
 	}
 
+	if p.deadline < 0 {
+		p.deadline = time.Second * 10
+	}
+
 	if p.size > 1024 {
 		p.size = 1024
 	}
@@ -237,8 +253,6 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 	if p.ctx == nil {
 		p.ctx = context.Background()
 	}
-
-	go p.Read()
 
 	return p, nil
 }
@@ -253,12 +267,8 @@ func Listen(network, addr string) (*icmp.PacketConn, error) {
 	return conn, nil
 }
 
-// Read reads data (blocking) from the connection and processes it.
-func (p *Pinger) Read() error {
-	if p.conn == nil {
-		return errors.New("connection must not be nil")
-	}
-
+// read reads data (blocking) from the connection and processes it.
+func (p *Pinger) read() error {
 	msgs := make(chan *msg, 100)
 
 	ctx := p.ctx
@@ -299,6 +309,9 @@ func (p *Pinger) finishWait() {
 	if diff := sent - received; diff > 0 {
 		p.wg.Add(-(diff))
 	}
+	if p.packetsSent.Len() > 0 {
+		close(p.finished)
+	}
 }
 
 func read4(ctx context.Context, conn *ipv4.PacketConn, recv chan<- *msg) error {
@@ -338,7 +351,7 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, recv chan<- *msg) error {
 	}
 }
 
-func read6(ctx context.Context, conn *ipv6.PacketConn, recv chan *msg) error {
+func read6(ctx context.Context, conn *ipv6.PacketConn, recv chan<- *msg) error {
 	defer close(recv)
 
 	for {
@@ -409,7 +422,7 @@ func (p *Pinger) processPing(msg *msg) error {
 
 		rcvd, ok = p.packetsRcvd.Load(msg.ipAddr)
 		if !ok {
-			rcvd = packetInfo{}
+			rcvd = packetInfo{ip: msg.ipAddr}
 		}
 
 		rcvd.packetsSent = sent.packetsSent
@@ -426,7 +439,24 @@ func (p *Pinger) processPing(msg *msg) error {
 		handler(outPkt)
 	}
 
+	if p.count > 0 && rcvd.packetsRcvd >= p.count {
+		p.sendFinish(msg.ipAddr, rcvd)
+	}
+
 	return nil
+}
+
+func (p *Pinger) sendFinish(ip string, v packetInfo) {
+	handler := p.onFinish
+	if handler != nil {
+		p.finished <- v
+		// delete so it doesn't get `onFinish`ed again. delete both so unfinished count is correct.
+		p.packetsSent.Delete(ip)
+		p.packetsRcvd.Delete(ip)
+		if p.packetsSent.Len() == 0 {
+			close(p.finished)
+		}
+	}
 }
 
 // Send sends count number of pings to each destination, respecting timeouts.
@@ -434,7 +464,18 @@ func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
 	if p.conn == nil {
 		return errors.New("connection must not be nil")
 	}
-	defer p.finish()
+
+	p.sendTex.Lock()
+	defer p.sendTex.Unlock()
+	go p.read()
+
+	p.finished = make(chan packetInfo, 100)
+
+	p.wg.Add(1)
+	go func() {
+		p.finish()
+		p.wg.Done()
+	}()
 
 	dests = append([]net.Addr{dest}, dests...)
 
@@ -525,6 +566,7 @@ func (p *Pinger) send(id int, destIP net.Addr) error {
 			p.packetsSent.Store(destIP.String(), packetInfo{
 				sentAt:      sentMap,
 				packetsSent: packetsSent,
+				ip:          destIP.String(),
 			})
 		}
 	}
@@ -538,17 +580,22 @@ func (p *Pinger) finish() {
 		return
 	}
 
+	for pkt := range p.finished {
+		handler(pkt.statistics())
+	}
+
 	rcvd := p.packetsRcvd.Copy()
 	for k, v := range p.packetsSent.Copy() {
 		if info, ok := rcvd[k]; ok {
-			handler(info.statistics(k))
+			info.packetsSent = v.packetsSent
+			handler(info.statistics())
 		} else {
-			handler(v.statistics(k))
+			handler(v.statistics())
 		}
 	}
 }
 
-func (v packetInfo) statistics(k string) *Statistics {
+func (v packetInfo) statistics() *Statistics {
 	loss := float64(v.packetsSent-v.packetsRcvd) / float64(v.packetsSent) * 100
 
 	var min, max, total time.Duration
@@ -571,7 +618,7 @@ func (v packetInfo) statistics(k string) *Statistics {
 		PacketsRecv: v.packetsRcvd,
 		PacketLoss:  loss,
 		RTTs:        v.rtts,
-		Addr:        k,
+		Addr:        v.ip,
 		MaxRTT:      max,
 		MinRTT:      min,
 	}
