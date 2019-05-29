@@ -46,6 +46,50 @@ func (p *pktMap) Load(key string) (packetInfo, bool) {
 	return val, ok
 }
 
+// Range calls f sequentially for each key and value present in the map.
+// If f returns false, range stops the iteration.
+func (p *pktMap) Range(f func(key string, value packetInfo) bool) {
+	p.tex.Lock()
+	fmt.Println(len(p.data))
+	for k, v := range p.data {
+		if !f(k, v) {
+			break
+		}
+	}
+	p.tex.Unlock()
+}
+
+// Len returns the number of packetInfo in pktMap.data in a thread safe manner.
+func (p *pktMap) Len() int {
+	p.tex.Lock()
+	i := len(p.data)
+	p.tex.Unlock()
+	return i
+}
+
+// Copy returns a copy of pktMap.data in a thread safe manner.
+func (p *pktMap) Copy() map[string]packetInfo {
+	m := make(map[string]packetInfo)
+	p.tex.Lock()
+	for k := range p.data {
+		m[k] = p.data[k]
+	}
+	p.tex.Unlock()
+	return m
+}
+
+// Packets returns the number of packets sent and received in a thread safe manner.
+func (p *pktMap) Packets() (int, int) {
+	var s, r uint
+	p.tex.Lock()
+	for k := range p.data {
+		s += p.data[k].packetsSent
+		r += p.data[k].packetsRcvd
+	}
+	p.tex.Unlock()
+	return int(s), int(r)
+}
+
 // Pinger is a thing that sends pings. You may have one per host you wish to ping, with
 // unique settings per each, or you may have one Pinger for multiple hosts you desire
 // to ping, with the same settings for each host.
@@ -170,7 +214,7 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 
 	p := &Pinger{
 		conn:        conn,
-		size:        64,
+		size:        56,
 		interval:    time.Second,
 		timeout:     time.Second * 5,
 		wg:          &sync.WaitGroup{},
@@ -194,6 +238,8 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 		p.ctx = context.Background()
 	}
 
+	go p.Read()
+
 	return p, nil
 }
 
@@ -215,23 +261,25 @@ func (p *Pinger) Read() error {
 
 	msgs := make(chan *msg, 100)
 
-	if c4 := p.conn.IPv4PacketConn(); c4 != nil {
-		go read4(p.ctx, c4, msgs)
-		p.proto = ProtocolICMP
-	} else if c6 := p.conn.IPv6PacketConn(); c6 != nil {
-		go read6(p.ctx, c6, msgs)
-		p.proto = ProtocolIPv6ICMP
-	}
-
+	ctx := p.ctx
 	var cancel context.CancelFunc
 	if p.deadline > 0 {
-		p.ctx, cancel = context.WithTimeout(p.ctx, p.deadline)
+		ctx, cancel = context.WithTimeout(ctx, p.deadline)
 		defer cancel()
+	}
+
+	if c4 := p.conn.IPv4PacketConn(); c4 != nil {
+		go read4(ctx, c4, msgs)
+		p.proto = ProtocolICMP
+	} else if c6 := p.conn.IPv6PacketConn(); c6 != nil {
+		go read6(ctx, c6, msgs)
+		p.proto = ProtocolIPv6ICMP
 	}
 
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-ctx.Done():
+			p.finishWait()
 			return p.ctx.Err()
 		case msg := <-msgs:
 			if msg == nil {
@@ -242,6 +290,14 @@ func (p *Pinger) Read() error {
 				return err
 			}
 		}
+	}
+}
+
+func (p *Pinger) finishWait() {
+	sent, _ := p.packetsSent.Packets()
+	_, received := p.packetsRcvd.Packets()
+	if diff := sent - received; diff > 0 {
+		p.wg.Add(-(diff))
 	}
 }
 
@@ -358,6 +414,7 @@ func (p *Pinger) processPing(msg *msg) error {
 
 		rcvd.packetsSent = sent.packetsSent
 		rcvd.packetsRcvd++
+		p.wg.Done()
 		rcvd.rtts = append(rcvd.rtts, outPkt.RTT)
 		p.packetsRcvd.Store(msg.ipAddr, rcvd)
 	default:
@@ -369,31 +426,24 @@ func (p *Pinger) processPing(msg *msg) error {
 		handler(outPkt)
 	}
 
-	if p.count > 0 && rcvd.packetsRcvd >= p.count {
-		p.sendFinish(msg.ipAddr, rcvd)
-	}
-
 	return nil
 }
 
 // Send sends count number of pings to each destination, respecting timeouts.
 func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
-	p.wg.Add(len(dests) + 1)
-
-	atomic.AddInt32(&p.queuedSends, int32(len(dests)+1))
 	if p.conn == nil {
-		p.wg.Add(-int(atomic.LoadInt32(&p.queuedSends)))
 		return errors.New("connection must not be nil")
 	}
+	defer p.finish()
 
 	dests = append([]net.Addr{dest}, dests...)
 
 	for _, destIP := range dests {
+		p.wg.Add(1)
 		go func(dest net.Addr) {
+			defer p.wg.Done()
 			err := p.send(int(atomic.LoadInt32(&id)), dest)
-			atomic.AddInt32(&p.queuedSends, int32(-1))
 			if err != nil {
-				p.wg.Done()
 				return
 			}
 		}(destIP)
@@ -468,6 +518,7 @@ func (p *Pinger) send(id int, destIP net.Addr) error {
 				return err
 			}
 			packetsSent++
+			p.wg.Add(1)
 
 			sentMap[sequence] = sentAt
 
@@ -481,12 +532,20 @@ func (p *Pinger) send(id int, destIP net.Addr) error {
 	return nil
 }
 
-func (p *Pinger) sendFinish(ip string, v packetInfo) {
+func (p *Pinger) finish() {
 	handler := p.onFinish
-	if handler != nil {
-		handler(v.statistics(ip))
+	if handler == nil {
+		return
 	}
-	p.wg.Done()
+
+	rcvd := p.packetsRcvd.Copy()
+	for k, v := range p.packetsSent.Copy() {
+		if info, ok := rcvd[k]; ok {
+			handler(info.statistics(k))
+		} else {
+			handler(v.statistics(k))
+		}
+	}
 }
 
 func (v packetInfo) statistics(k string) *Statistics {

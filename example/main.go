@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
+	"time"
 
 	"github.com/glinton/go-ping"
 )
@@ -28,9 +32,22 @@ func main() {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for range c {
+			cancel()
+		}
+	}()
+
 	pinger, err := ping.NewPinger(
 		conn,
-		ping.WithCount(5),
+		ping.WithCount(3),
+		ping.WithContext(ctx),
+		ping.WithDeadline(time.Second*5),
 		ping.WithOnRecieve(printRcvd),
 		ping.WithOnFinish(printStat),
 	)
@@ -38,8 +55,6 @@ func main() {
 		fmt.Println(err)
 		return
 	}
-
-	go pinger.Read()
 
 	localhost, err := net.ResolveIPAddr("ip", "localhost")
 	if err != nil {
