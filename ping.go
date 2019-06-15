@@ -57,7 +57,6 @@ func (p *pktMap) Load(key string) (packetInfo, bool) {
 // If f returns false, range stops the iteration.
 func (p *pktMap) Range(f func(key string, value packetInfo) bool) {
 	p.tex.Lock()
-	fmt.Println(len(p.data))
 	for k, v := range p.data {
 		if !f(k, v) {
 			break
@@ -258,7 +257,8 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 }
 
 // Listen listens on a network ('ip4:icmp', 'ip6:ipv6-icmp', 'udp4', or 'udp6')
-// and optional address (blank string for any address/interface).
+// and optional address (blank string for any address/interface). Use 'udp' to
+// initialize a non-privileged datagram-oriented ICMP endpoint.
 func Listen(network, addr string) (*icmp.PacketConn, error) {
 	conn, err := icmp.ListenPacket(network, addr)
 	if err != nil {
@@ -279,11 +279,11 @@ func (p *Pinger) read() error {
 	}
 
 	if c4 := p.conn.IPv4PacketConn(); c4 != nil {
-		go read4(ctx, c4, msgs)
 		p.proto = ProtocolICMP
+		go read4(ctx, c4, msgs)
 	} else if c6 := p.conn.IPv6PacketConn(); c6 != nil {
-		go read6(ctx, c6, msgs)
 		p.proto = ProtocolIPv6ICMP
+		go read6(ctx, c6, msgs)
 	}
 
 	for {
@@ -384,8 +384,6 @@ func read6(ctx context.Context, conn *ipv6.PacketConn, recv chan<- *msg) error {
 			}
 
 			recv <- &msg{data: bytesReceived[:n], nbytes: n, ipAddr: src.String(), ttl: ttl}
-
-			bytesReceived = bytesReceived[:0:0]
 		}
 	}
 }
@@ -460,6 +458,9 @@ func (p *Pinger) sendFinish(ip string, v packetInfo) {
 }
 
 // Send sends count number of pings to each destination, respecting timeouts.
+// If the conn on the pinger is a non-privileged datagram-oriented ICMP endpoint
+// (`Listen` called with a network of 'udp4' or 'udp6'), the provided net.Addr
+// must be a net.UDPAddr. Otherwise it must be net.IPAddr.
 func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
 	if p.conn == nil {
 		return errors.New("connection must not be nil")
