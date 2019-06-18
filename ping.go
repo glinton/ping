@@ -1,3 +1,5 @@
+// Package ping provides a concurrent-first library for sending ICMP Echo packets
+// in pure go.
 package ping
 
 import (
@@ -259,6 +261,20 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 // Listen listens on a network ('ip4:icmp', 'ip6:ipv6-icmp', 'udp4', or 'udp6')
 // and optional address (blank string for any address/interface). Use 'udp' to
 // initialize a non-privileged datagram-oriented ICMP endpoint.
+//
+// On Linux and Darwin, the preferred method is to listen on a non-privileged network
+// (`udp4` or `udp6` as the network). On Linux, the system group of the user running
+// the application must be allowed to create ICMP Echo sockets. See man pages icmp(7)
+// for `ping_group_range`.
+//
+// To allow a range of groups access to create icmp sockets on linux (ipv4 or ipv6), run:
+//
+//     sudo sysctl -w net.ipv4.ping_group_range="GROUPID_START   GROUPID_END"
+//
+// If you plan to run your application as `root`, the aforementioned commmand is not necessary.
+//
+// When running on Windows, you must call `Listen` with either `ip4:icmp` or `ip6:ipv6-icmp`
+// as the network to avoid receiving an error.
 func Listen(network, addr string) (*icmp.PacketConn, error) {
 	conn, err := icmp.ListenPacket(network, addr)
 	if err != nil {
@@ -582,21 +598,22 @@ func (p *Pinger) finish() {
 	}
 
 	for pkt := range p.finished {
-		handler(pkt.statistics())
+		handler(pkt.Statistics())
 	}
 
 	rcvd := p.packetsRcvd.Copy()
 	for k, v := range p.packetsSent.Copy() {
 		if info, ok := rcvd[k]; ok {
 			info.packetsSent = v.packetsSent
-			handler(info.statistics())
+			handler(info.Statistics())
 		} else {
-			handler(v.statistics())
+			handler(v.Statistics())
 		}
 	}
 }
 
-func (v packetInfo) statistics() *Statistics {
+// Statistics returns stats for received ping packets.
+func (v packetInfo) Statistics() *Statistics {
 	loss := float64(v.packetsSent-v.packetsRcvd) / float64(v.packetsSent) * 100
 
 	var min, max, total time.Duration
