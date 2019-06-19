@@ -33,6 +33,10 @@ type pktMap struct {
 	tex  *sync.Mutex
 }
 
+func newPktMap() pktMap {
+	return pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)}
+}
+
 // Store stores packetInfo into pktMap in a thread safe manner.
 func (p *pktMap) Store(key string, val packetInfo) {
 	p.tex.Lock()
@@ -53,18 +57,6 @@ func (p *pktMap) Load(key string) (packetInfo, bool) {
 	val, ok := p.data[key]
 	p.tex.Unlock()
 	return val, ok
-}
-
-// Range calls f sequentially for each key and value present in the map.
-// If f returns false, range stops the iteration.
-func (p *pktMap) Range(f func(key string, value packetInfo) bool) {
-	p.tex.Lock()
-	for k, v := range p.data {
-		if !f(k, v) {
-			break
-		}
-	}
-	p.tex.Unlock()
 }
 
 // Len returns the number of packetInfo in pktMap.data in a thread safe manner.
@@ -230,8 +222,8 @@ func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
 		timeout:     time.Second * 5,
 		deadline:    time.Second * 10,
 		wg:          &sync.WaitGroup{},
-		packetsSent: pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)},
-		packetsRcvd: pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)},
+		packetsSent: newPktMap(),
+		packetsRcvd: newPktMap(),
 		sendTex:     &sync.Mutex{},
 	}
 
@@ -305,7 +297,6 @@ func (p *Pinger) read() error {
 	for {
 		select {
 		case <-ctx.Done():
-			p.finishWait()
 			return p.ctx.Err()
 		case msg := <-msgs:
 			if msg == nil {
@@ -320,13 +311,18 @@ func (p *Pinger) read() error {
 }
 
 func (p *Pinger) finishWait() {
-	sent, _ := p.packetsSent.Packets()
-	_, received := p.packetsRcvd.Packets()
-	if diff := sent - received; diff > 0 {
-		p.wg.Add(-(diff))
-	}
-	if p.packetsSent.Len() > 0 {
-		close(p.finished)
+	select {
+	case <-p.ctx.Done():
+		sent, _ := p.packetsSent.Packets()
+		_, received := p.packetsRcvd.Packets()
+		if diff := sent - received; diff > 0 {
+			p.wg.Add(-(diff))
+		}
+		if p.packetsSent.Len() > 0 {
+			close(p.finished)
+		}
+	default:
+		break
 	}
 }
 
@@ -441,6 +437,7 @@ func (p *Pinger) processPing(msg *msg) error {
 
 		rcvd.packetsSent = sent.packetsSent
 		rcvd.packetsRcvd++
+
 		p.wg.Done()
 		rcvd.rtts = append(rcvd.rtts, outPkt.RTT)
 		p.packetsRcvd.Store(msg.ipAddr, rcvd)
@@ -467,9 +464,9 @@ func (p *Pinger) sendFinish(ip string, v packetInfo) {
 		// delete so it doesn't get `onFinish`ed again. delete both so unfinished count is correct.
 		p.packetsSent.Delete(ip)
 		p.packetsRcvd.Delete(ip)
-		if p.packetsSent.Len() == 0 {
-			close(p.finished)
-		}
+	}
+	if p.packetsSent.Len() == 0 {
+		close(p.finished)
 	}
 }
 
@@ -484,6 +481,7 @@ func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
 
 	p.sendTex.Lock()
 	defer p.sendTex.Unlock()
+	// todo: move into newpinger? in case of go send(1), go send(2), ...etc
 	go p.read()
 
 	p.finished = make(chan packetInfo, 100)
@@ -494,16 +492,21 @@ func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
 		p.wg.Done()
 	}()
 
+	var errs error
 	dests = append([]net.Addr{dest}, dests...)
 
 	for _, destIP := range dests {
 		p.wg.Add(1)
 		go func(dest net.Addr) {
-			defer p.wg.Done()
 			err := p.send(int(atomic.LoadInt32(&id)), dest)
 			if err != nil {
+				close(p.finished)
+				p.wg.Done()
+				errs = appendError(errs, err)
 				return
 			}
+			p.finishWait()
+			p.wg.Done()
 		}(destIP)
 
 		if atomic.LoadInt32(&id) >= math.MaxInt32 {
@@ -514,7 +517,14 @@ func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
 	}
 
 	p.wg.Wait()
-	return nil
+	return errs
+}
+
+func appendError(err0, err1 error) error {
+	if err0 != nil {
+		return fmt.Errorf("%s;%s", err0, err1)
+	}
+	return err1
 }
 
 func (p *Pinger) send(id int, destIP net.Addr) error {
@@ -534,10 +544,11 @@ func (p *Pinger) send(id int, destIP net.Addr) error {
 		sentMap     = make(map[uint]time.Time, p.count)
 	)
 
-	for packetsSent < p.count {
+	for p.count == 0 || packetsSent < p.count {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// avoid closing closed channel (finishWait)
+			return nil
 		case <-tick.C:
 			sequence++
 
@@ -593,27 +604,30 @@ func (p *Pinger) send(id int, destIP net.Addr) error {
 
 func (p *Pinger) finish() {
 	handler := p.onFinish
-	if handler == nil {
-		return
+	for pkt := range p.finished {
+		if handler == nil {
+			continue
+		}
+		handler(pkt.statistics())
 	}
 
-	for pkt := range p.finished {
-		handler(pkt.Statistics())
+	if handler == nil {
+		return
 	}
 
 	rcvd := p.packetsRcvd.Copy()
 	for k, v := range p.packetsSent.Copy() {
 		if info, ok := rcvd[k]; ok {
 			info.packetsSent = v.packetsSent
-			handler(info.Statistics())
+			handler(info.statistics())
 		} else {
-			handler(v.Statistics())
+			handler(v.statistics())
 		}
 	}
 }
 
-// Statistics returns stats for received ping packets.
-func (v packetInfo) Statistics() *Statistics {
+// statistics returns stats for received ping packets.
+func (v packetInfo) statistics() *Statistics {
 	loss := float64(v.packetsSent-v.packetsRcvd) / float64(v.packetsSent) * 100
 
 	var min, max, total time.Duration
