@@ -1,5 +1,3 @@
-// Package ping provides a concurrent-first library for sending ICMP Echo packets
-// in pure go.
 package ping
 
 import (
@@ -7,10 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -18,339 +14,202 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-var (
-	id int32
-)
-
 const (
-	ProtocolICMP     = 1  // Internet Control Message for IPv4
-	ProtocolIPv6ICMP = 58 // ICMP for IPv6
+	// ProtocolIPv4ICMP defines ICMP for IPv4.
+	ProtocolIPv4ICMP = 1
+	// ProtocolIPv6ICMP defines ICMP for IPv6.
+	ProtocolIPv6ICMP = 58
 )
 
-// pktMap is a threadsafe map for storing and loading packetInfo.
-type pktMap struct {
-	data map[string]packetInfo
-	tex  *sync.Mutex
+// A Request represents an icmp echo request to be sent by a client.
+type Request struct {
+	reqTex  *sync.Mutex // request lock
+	sentAt  time.Time   // time at which echo request was sent
+	dst     net.Addr    // useable destination address
+	proto   int         // icmp protocol (4 or 6)
+	network string      // one of 'ip4:icmp', 'ip6:ipv6-icmp', 'udp4', or 'udp6' for privileged/non-privileged datagrams
+
+	ID   int    // icmp.Echo.ID - for differentiating pin. if not set manually, do automatically. an identifier to aid in matching echos and replies, may be zero.
+	Seq  int    // Seq is the ICMP sequence number. a sequence number to aid in matching echos and replies, may be zero.
+	Data []byte // maybe don't want to do this, too much freedom. if so, limit size. used to set icmp.Echo.Data
+
+	Dst net.IP // The address of the host to which the message should be sent.
+	Src net.IP // The address of the host that composes the ICMP message.
 }
 
-func newPktMap() pktMap {
-	return pktMap{tex: &sync.Mutex{}, data: make(map[string]packetInfo)}
+// Response represents an icmp echo response received by a client.
+type Response struct {
+	rcvdAt time.Time // time at which echo response was received
+
+	TotalLength int           // Length of internet header and data in octets.
+	TTL         int           // Time to live in seconds; as this field is decremented at each machine in which the datagram is processed, the value in this field should be at least as great as the number of gateways which this datagram will traverse. Maximum possible value of this field is 255.
+	Src         net.IP        // The address of the host that composed the ICMP message.
+	Dst         net.IP        // The address of the host to which the message was received from.
+	RTT         time.Duration // RTT is the round-trip time it took to ping.
+
+	ID   int    // icmp.Echo.ID - for differentiating pin. if not set manually, do automatically. an identifier to aid in matching echos and replies, may be zero.
+	Seq  uint   // Seq is the ICMP sequence number. a sequence number to aid in matching echos and replies, may be zero.
+	Data []byte // maybe don't want to do this, too much freedom. if so, limit size. used to set icmp.Echo.Data
+
+	Req *Request // Req is the request that elicited this response.
 }
 
-// Store stores packetInfo into pktMap in a thread safe manner.
-func (p *pktMap) Store(key string, val packetInfo) {
-	p.tex.Lock()
-	p.data[key] = val
-	p.tex.Unlock()
-}
+// Client is a ping client.
+type Client struct{}
 
-// Delete deletes packetInfo from pktMap in a thread safe manner.
-func (p *pktMap) Delete(key string) {
-	p.tex.Lock()
-	delete(p.data, key)
-	p.tex.Unlock()
-}
+// Do sends a ping request and returns a ping response.
+func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
+	req.reqTex = &sync.Mutex{}
 
-// Load returns packetInfo from pktMap in a thread safe manner.
-func (p *pktMap) Load(key string) (packetInfo, bool) {
-	p.tex.Lock()
-	val, ok := p.data[key]
-	p.tex.Unlock()
-	return val, ok
-}
-
-// Len returns the number of packetInfo in pktMap.data in a thread safe manner.
-func (p *pktMap) Len() int {
-	p.tex.Lock()
-	i := len(p.data)
-	p.tex.Unlock()
-	return i
-}
-
-// Copy returns a copy of pktMap.data in a thread safe manner.
-func (p *pktMap) Copy() map[string]packetInfo {
-	m := make(map[string]packetInfo)
-	p.tex.Lock()
-	for k := range p.data {
-		m[k] = p.data[k]
-	}
-	p.tex.Unlock()
-	return m
-}
-
-// Packets returns the number of packets sent and received in a thread safe manner.
-func (p *pktMap) Packets() (int, int) {
-	var s, r uint
-	p.tex.Lock()
-	for k := range p.data {
-		s += p.data[k].packetsSent
-		r += p.data[k].packetsRcvd
-	}
-	p.tex.Unlock()
-	return int(s), int(r)
-}
-
-// Pinger is a thing that sends pings. You may have one per host you wish to ping, with
-// unique settings per each, or you may have one Pinger for multiple hosts you desire
-// to ping, with the same settings for each host.
-type Pinger struct {
-	wg       *sync.WaitGroup
-	sendTex  *sync.Mutex
-	ctx      context.Context
-	finished chan packetInfo
-
-	proto       int    // iana icmp protocol
-	packetsRcvd pktMap // packetsRcvd contains the aggregated stats for packets received.
-	packetsSent pktMap // packetsSent contains information for calculating packet stats on receipt.
-	queuedSends int32  // number of pings queued for sending
-
-	onRecv   func(*Packet)     // onRecv is called when Pinger receives and processes a packet
-	onFinish func(*Statistics) // onFinish is called when Pinger exits
-
-	conn *icmp.PacketConn // conn is the connection to send the pings over
-
-	size     uint          // size is the size in bytes of a ping to send. Default is 64 bytes.
-	count    uint          // count is how many pings to send. 0 is no limit.
-	interval time.Duration // interval defines the interval at which pings are sent. Must be 200ms or greater.
-	timeout  time.Duration // timeout defines the per-ping timeout. 0 means no timeout.
-	deadline time.Duration // deadline defines the overall ping timeout. 0 means no timeout.
-}
-
-// Statistics defines the aggregated statistics of received ping packets.
-type Statistics struct {
-	PacketsSent uint            // PacketsSent is the number of packets sent.
-	PacketsRecv uint            // PacketsRecv is the number of packets received.
-	PacketLoss  float64         // PacketLoss is the percentage of packets lost.
-	Addr        string          // Addr is the string address of the host being pinged.
-	RTTs        []time.Duration // RTTs is all of the round-trip times sent via this pinger.
-	MinRTT      time.Duration   // MinRTT is the minimum round-trip time sent via this pinger.
-	MaxRTT      time.Duration   // MaxRTT is the maximum round-trip time sent via this pinger.
-	AvgRTT      time.Duration   // AvgRTT is the average round-trip time sent via this pinger.
-	StdDevRTT   time.Duration   // StdDevRTT is the standard deviation of the round-trip times sent via this pinger.
-}
-
-// Packet is defines ping packet statistics.
-type Packet struct {
-	Nbytes int           // NBytes is the number of bytes in the message.
-	IPAddr string        // IPAddr is the address of the host being pinged.
-	Seq    int           // Seq is the ICMP sequence number.
-	TTL    int           // TTL is the Time to Live on the packet.
-	RTT    time.Duration // RTT is the round-trip time it took to ping.
-}
-
-type packetInfo struct {
-	ip          string             // ping destination
-	sentAt      map[uint]time.Time // records the time the ping was sent
-	packetsSent uint               // tallies the number of packet's sent
-	packetsRcvd uint               // tallies the number of packet's received
-	rtts        []time.Duration    // combined round-trip-times for all pings
-}
-
-type msg struct {
-	data   []byte // ping payload
-	ttl    int    // ttl (part of a control message)
-	nbytes int    // nubmer of bytes received in echo-reply
-	ipAddr string // ip address of remote host
-}
-
-// WithOnRecieve allows setting a callback for when an echo response has been recieved.
-func WithOnRecieve(fn func(*Packet)) func(*Pinger) {
-	return func(p *Pinger) {
-		p.onRecv = fn
-	}
-}
-
-// WithOnFinish allows setting a callback for when pinging a host has completed.
-func WithOnFinish(fn func(*Statistics)) func(*Pinger) {
-	return func(p *Pinger) {
-		p.onFinish = fn
-	}
-}
-
-// WithContext allows setting the context used.
-func WithContext(ctx context.Context) func(*Pinger) {
-	return func(p *Pinger) {
-		p.ctx = ctx
-	}
-}
-
-// WithSize allows setting the size (in bytes) of a ping to be sent. Default is 64 bytes.
-func WithSize(i uint) func(*Pinger) {
-	return func(p *Pinger) {
-		p.size = i
-	}
-}
-
-// WithCount allows setting the number of pings to send. Default is is no limit (0).
-func WithCount(i uint) func(*Pinger) {
-	return func(p *Pinger) {
-		p.count = i
-	}
-}
-
-// WithInterval allows setting the interval at which pings are sent. Must be 200ms or greater.
-func WithInterval(d time.Duration) func(*Pinger) {
-	return func(p *Pinger) {
-		p.interval = d
-	}
-}
-
-// WithTimeout allows setting the per-ping timeout. Default is 5 seconds.
-func WithTimeout(d time.Duration) func(*Pinger) {
-	return func(p *Pinger) {
-		p.timeout = d
-	}
-}
-
-// WithDeadline allows setting the total ping timeout per host. Default is 10 seconds.
-func WithDeadline(d time.Duration) func(*Pinger) {
-	return func(p *Pinger) {
-		p.deadline = d
-	}
-}
-
-// NewPinger returns a new pinger with configured options.
-func NewPinger(conn *icmp.PacketConn, opts ...func(*Pinger)) (*Pinger, error) {
-	if conn == nil {
-		return nil, errors.New("connection must not be nil")
-	}
-
-	p := &Pinger{
-		conn:        conn,
-		size:        56,
-		interval:    time.Second,
-		timeout:     time.Second * 5,
-		deadline:    time.Second * 10,
-		wg:          &sync.WaitGroup{},
-		packetsSent: newPktMap(),
-		packetsRcvd: newPktMap(),
-		sendTex:     &sync.Mutex{},
-	}
-
-	for i := range opts {
-		opts[i](p)
-	}
-
-	if p.interval < time.Millisecond*200 {
-		p.interval = time.Millisecond * 200
-	}
-
-	if p.deadline < 0 {
-		p.deadline = time.Second * 10
-	}
-
-	if p.size > 1024 {
-		p.size = 1024
-	}
-
-	if p.ctx == nil {
-		p.ctx = context.Background()
-	}
-
-	return p, nil
-}
-
-// Listen listens on a network ('ip4:icmp', 'ip6:ipv6-icmp', 'udp4', or 'udp6')
-// and optional address (blank string for any address/interface). Use 'udp' to
-// initialize a non-privileged datagram-oriented ICMP endpoint.
-//
-// On Linux and Darwin, the preferred method is to listen on a non-privileged network
-// (`udp4` or `udp6` as the network). On Linux, the system group of the user running
-// the application must be allowed to create ICMP Echo sockets. See man pages icmp(7)
-// for `ping_group_range`.
-//
-// To allow a range of groups access to create icmp sockets on linux (ipv4 or ipv6), run:
-//
-//     sudo sysctl -w net.ipv4.ping_group_range="GROUPID_START   GROUPID_END"
-//
-// If you plan to run your application as `root`, the aforementioned commmand is not necessary.
-//
-// When running on Windows, you must call `Listen` with either `ip4:icmp` or `ip6:ipv6-icmp`
-// as the network to avoid receiving an error.
-func Listen(network, addr string) (*icmp.PacketConn, error) {
-	conn, err := icmp.ListenPacket(network, addr)
+	conn, err := c.listen(&req)
 	if err != nil {
-		return nil, fmt.Errorf("error listening for ICMP packets: %s", err.Error())
+		return nil, err
 	}
+
+	var addr net.Addr
+	if req.isIPv6() {
+		addr, err = net.ResolveIPAddr("ip6", req.Dst.String())
+	} else {
+		addr, err = net.ResolveIPAddr("ip4", req.Dst.String())
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	switch req.network {
+	case "udp4", "udp6":
+		if a, ok := addr.(*net.IPAddr); ok {
+			req.dst = &net.UDPAddr{IP: a.IP, Zone: a.Zone}
+		}
+	}
+
+	var (
+		resp    *Response
+		readErr error
+
+		wg = &sync.WaitGroup{}
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, readErr = read(ctx, conn)
+		if readErr != nil {
+			return
+		}
+
+		req.reqTex.Lock()
+		resp.Req = &req
+		resp.RTT = resp.rcvdAt.Sub(req.sentAt)
+		req.reqTex.Unlock()
+	}()
+
+	err = send(ctx, conn, &req)
+	if err != nil {
+		return nil, err
+	}
+
+	wg.Wait()
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	return resp, nil
+}
+
+// listen tries first to create a privileged datagram-oriented ICMP endpoint then
+// attempts to create a non-privileged one. If both fail, it returns an error.
+func (c *Client) listen(req *Request) (*icmp.PacketConn, error) {
+	req.network = "ip4:icmp"
+	req.proto = ProtocolIPv4ICMP
+
+	if req.isIPv6() {
+		req.proto = ProtocolIPv6ICMP
+		req.network = "ip6:ipv6-icmp"
+	}
+
+	srcIP := req.Src.String()
+	if srcIP == "<nil>" {
+		srcIP = ""
+	}
+
+	conn, err := icmp.ListenPacket(req.network, srcIP)
+	if err != nil {
+		req.network = "udp4"
+		if req.isIPv6() {
+			req.network = "udp6"
+		}
+
+		var err2 error
+		conn, err2 = icmp.ListenPacket(req.network, srcIP)
+		if err2 != nil {
+			return nil, fmt.Errorf("error listening for ICMP packets: %s: %s", err.Error(), err2.Error())
+		}
+	}
+
 	return conn, nil
 }
 
-// read reads data (blocking) from the connection and processes it.
-func (p *Pinger) read() error {
-	msgs := make(chan *msg, 100)
-
-	ctx := p.ctx
-	var cancel context.CancelFunc
-	if p.deadline > 0 {
-		ctx, cancel = context.WithTimeout(ctx, p.deadline)
-		defer cancel()
+func (req *Request) isIPv6() bool {
+	if p4 := req.Dst.To4(); len(p4) == net.IPv4len {
+		return false
 	}
+	return true
+}
 
-	if c4 := p.conn.IPv4PacketConn(); c4 != nil {
-		p.proto = ProtocolICMP
-		go read4(ctx, c4, msgs)
-	} else if c6 := p.conn.IPv6PacketConn(); c6 != nil {
-		p.proto = ProtocolIPv6ICMP
-		go read6(ctx, c6, msgs)
+func read(ctx context.Context, conn *icmp.PacketConn) (*Response, error) {
+	if c4 := conn.IPv4PacketConn(); c4 != nil {
+		return read4(ctx, c4)
 	}
+	c6 := conn.IPv6PacketConn()
+	if c6 == nil {
+		return nil, errors.New("bad icmp connection type")
+	}
+	return read6(ctx, c6)
+}
 
+func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return p.ctx.Err()
-		case msg := <-msgs:
-			if msg == nil {
-				continue
-			}
-			err := p.processPing(msg)
-			if err != nil {
-				return err
-			}
-		}
-	}
-}
-
-func (p *Pinger) finishWait() {
-	select {
-	case <-p.ctx.Done():
-		sent, _ := p.packetsSent.Packets()
-		_, received := p.packetsRcvd.Packets()
-		if diff := sent - received; diff > 0 {
-			p.wg.Add(-(diff))
-		}
-		if p.packetsSent.Len() > 0 {
-			close(p.finished)
-		}
-	default:
-		break
-	}
-}
-
-func read4(ctx context.Context, conn *ipv4.PacketConn, recv chan<- *msg) error {
-	defer close(recv)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 300))
 			bytesReceived := make([]byte, 1500)
 
 			n, cm, src, err := conn.ReadFrom(bytesReceived)
+			rcv := time.Now()
 			if err != nil {
 				if neterr, ok := err.(*net.OpError); ok {
 					if neterr.Timeout() {
 						continue
 					} else {
-						return err
+						return nil, err
 					}
 				}
-				return err
+				return nil, err
 			}
 
 			if n <= 0 {
 				continue
+			}
+
+			m, err := icmp.ParseMessage(ProtocolIPv4ICMP, bytesReceived[:n])
+			if err != nil {
+				return nil, err
+			}
+
+			if m.Type != ipv4.ICMPTypeEchoReply {
+				// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
+				continue
+			}
+
+			var seq uint
+			var id int
+			b, ok := m.Body.(*icmp.Echo)
+			if ok {
+				seq = uint(b.Seq)
+				id = b.ID
 			}
 
 			var ttl int
@@ -358,36 +217,64 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, recv chan<- *msg) error {
 				ttl = cm.TTL
 			}
 
-			recv <- &msg{data: bytesReceived[:n], nbytes: n, ipAddr: src.String(), ttl: ttl}
+			srcHost, _, _ := net.SplitHostPort(src.String())
+			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+			return &Response{
+				ID:          id,
+				Seq:         seq,
+				Data:        bytesReceived[:n],
+				TotalLength: n,
+				Src:         net.ParseIP(srcHost),
+				Dst:         net.ParseIP(dstHost),
+				TTL:         ttl,
+				rcvdAt:      rcv,
+			}, nil
 		}
 	}
 }
 
-func read6(ctx context.Context, conn *ipv6.PacketConn, recv chan<- *msg) error {
-	defer close(recv)
-
+func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 300))
 			bytesReceived := make([]byte, 1500)
 
 			n, cm, src, err := conn.ReadFrom(bytesReceived)
+			rcv := time.Now()
 			if err != nil {
 				if neterr, ok := err.(*net.OpError); ok {
 					if neterr.Timeout() {
 						continue
 					} else {
-						return err
+						return nil, err
 					}
 				}
-				return err
+				return nil, err
 			}
 
 			if n <= 0 {
 				continue
+			}
+
+			m, err := icmp.ParseMessage(ProtocolIPv6ICMP, bytesReceived[:n])
+			if err != nil {
+				return nil, err
+			}
+
+			if m.Type != ipv6.ICMPTypeEchoReply {
+				// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
+				continue
+			}
+
+			var seq uint
+			var id int
+			b, ok := m.Body.(*icmp.Echo)
+			if ok {
+				seq = uint(b.Seq)
+				id = b.ID
 			}
 
 			var ttl int
@@ -395,274 +282,71 @@ func read6(ctx context.Context, conn *ipv6.PacketConn, recv chan<- *msg) error {
 				ttl = cm.HopLimit
 			}
 
-			recv <- &msg{data: bytesReceived[:n], nbytes: n, ipAddr: src.String(), ttl: ttl}
+			srcHost, _, _ := net.SplitHostPort(src.String())
+			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+			return &Response{
+				ID:          id,
+				Seq:         seq,
+				Data:        bytesReceived[:n],
+				TotalLength: n,
+				Src:         net.ParseIP(srcHost),
+				Dst:         net.ParseIP(dstHost),
+				TTL:         ttl,
+				rcvdAt:      rcv,
+			}, nil
 		}
 	}
 }
 
-func (p *Pinger) processPing(msg *msg) error {
-	receivedAt := time.Now()
-
-	m, err := icmp.ParseMessage(p.proto, msg.data)
-	if err != nil {
-		return err
+func (req *Request) data() []byte {
+	if len(req.Data) == 0 {
+		return bytes.Repeat([]byte{1}, 56)
 	}
+	return req.Data
+}
 
-	if m.Type != ipv4.ICMPTypeEchoReply && m.Type != ipv6.ICMPTypeEchoReply {
-		// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
+func send(ctx context.Context, conn *icmp.PacketConn, req *Request) error {
+	select {
+	case <-ctx.Done():
 		return nil
-	}
-
-	outPkt := &Packet{
-		Nbytes: msg.nbytes,
-		IPAddr: msg.ipAddr,
-		TTL:    msg.ttl,
-	}
-
-	rcvd := packetInfo{}
-
-	switch pkt := m.Body.(type) {
-	case *icmp.Echo:
-		sent, ok := p.packetsSent.Load(msg.ipAddr)
-		if !ok {
-			return fmt.Errorf("received unsolicited response from '%s'", msg.ipAddr)
-		}
-		outPkt.RTT = receivedAt.Sub(sent.sentAt[uint(pkt.Seq)])
-		outPkt.Seq = pkt.Seq
-
-		rcvd, ok = p.packetsRcvd.Load(msg.ipAddr)
-		if !ok {
-			rcvd = packetInfo{ip: msg.ipAddr}
-		}
-
-		rcvd.packetsSent = sent.packetsSent
-		rcvd.packetsRcvd++
-
-		p.wg.Done()
-		rcvd.rtts = append(rcvd.rtts, outPkt.RTT)
-		p.packetsRcvd.Store(msg.ipAddr, rcvd)
 	default:
-		return fmt.Errorf("invalid ICMP echo reply; type: '%T', '%v'", pkt, pkt)
-	}
+		body := &icmp.Echo{
+			ID:   req.ID,
+			Seq:  int(req.Seq),
+			Data: req.data(),
+		}
 
-	handler := p.onRecv
-	if handler != nil {
-		handler(outPkt)
-	}
+		msg := &icmp.Message{
+			Type: ipv6.ICMPTypeEchoRequest,
+			Code: 0,
+			Body: body,
+		}
 
-	if p.count > 0 && rcvd.packetsRcvd >= p.count {
-		p.sendFinish(msg.ipAddr, rcvd)
+		if req.proto == ProtocolIPv4ICMP {
+			msg.Type = ipv4.ICMPTypeEcho
+			conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
+		} else {
+			conn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true)
+		}
+
+		msgBytes, err := msg.Marshal(nil)
+		if err != nil {
+			return err
+		}
+
+		if timeout, ok := ctx.Deadline(); ok {
+			if err := conn.SetWriteDeadline(timeout); err != nil {
+				return err
+			}
+		}
+
+		if _, err := conn.WriteTo(msgBytes, req.dst); err != nil {
+			return err
+		}
+		req.reqTex.Lock()
+		req.sentAt = time.Now()
+		req.reqTex.Unlock()
 	}
 
 	return nil
-}
-
-func (p *Pinger) sendFinish(ip string, v packetInfo) {
-	handler := p.onFinish
-	if handler != nil {
-		p.finished <- v
-		// delete so it doesn't get `onFinish`ed again. delete both so unfinished count is correct.
-		p.packetsSent.Delete(ip)
-		p.packetsRcvd.Delete(ip)
-	}
-	if p.packetsSent.Len() == 0 {
-		close(p.finished)
-	}
-}
-
-// Send sends count number of pings to each destination, respecting timeouts.
-// If the conn on the pinger is a non-privileged datagram-oriented ICMP endpoint
-// (`Listen` called with a network of 'udp4' or 'udp6'), the provided net.Addr
-// must be a net.UDPAddr. Otherwise it must be net.IPAddr.
-func (p *Pinger) Send(dest net.Addr, dests ...net.Addr) error {
-	if p.conn == nil {
-		return errors.New("connection must not be nil")
-	}
-
-	p.sendTex.Lock()
-	defer p.sendTex.Unlock()
-	// todo: move into newpinger? in case of go send(1), go send(2), ...etc
-	go p.read()
-
-	p.finished = make(chan packetInfo, 100)
-
-	p.wg.Add(1)
-	go func() {
-		p.finish()
-		p.wg.Done()
-	}()
-
-	var errs error
-	dests = append([]net.Addr{dest}, dests...)
-
-	for _, destIP := range dests {
-		p.wg.Add(1)
-		go func(dest net.Addr) {
-			err := p.send(int(atomic.LoadInt32(&id)), dest)
-			if err != nil {
-				close(p.finished)
-				p.wg.Done()
-				errs = appendError(errs, err)
-				return
-			}
-			p.finishWait()
-			p.wg.Done()
-		}(destIP)
-
-		if atomic.LoadInt32(&id) >= math.MaxInt32 {
-			atomic.StoreInt32(&id, 0)
-		} else {
-			atomic.AddInt32(&id, 1)
-		}
-	}
-
-	p.wg.Wait()
-	return errs
-}
-
-func appendError(err0, err1 error) error {
-	if err0 != nil {
-		return fmt.Errorf("%s;%s", err0, err1)
-	}
-	return err1
-}
-
-func (p *Pinger) send(id int, destIP net.Addr) error {
-	ctx := p.ctx
-	var cancel context.CancelFunc
-	if p.deadline > 0 {
-		ctx, cancel = context.WithTimeout(p.ctx, p.deadline)
-		defer cancel()
-	}
-
-	tick := time.NewTicker(p.interval)
-	defer tick.Stop()
-
-	var (
-		sequence    uint
-		packetsSent uint
-		sentMap     = make(map[uint]time.Time, p.count)
-	)
-
-	for p.count == 0 || packetsSent < p.count {
-		select {
-		case <-ctx.Done():
-			// avoid closing closed channel (finishWait)
-			return nil
-		case <-tick.C:
-			sequence++
-
-			body := &icmp.Echo{
-				ID:   id,
-				Seq:  int(sequence),
-				Data: bytes.Repeat([]byte{1}, int(p.size)),
-			}
-
-			msg := &icmp.Message{
-				Type: ipv6.ICMPTypeEchoRequest,
-				Code: 0,
-				Body: body,
-			}
-
-			if c4 := p.conn.IPv4PacketConn(); c4 != nil {
-				msg.Type = ipv4.ICMPTypeEcho
-				p.conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
-			} else {
-				p.conn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true)
-			}
-
-			msgBytes, err := msg.Marshal(nil)
-			if err != nil {
-				return err
-			}
-
-			if p.timeout > 0 {
-				if err := p.conn.SetWriteDeadline(time.Now().Add(p.timeout)); err != nil {
-					return err
-				}
-			}
-
-			sentAt := time.Now()
-			if _, err := p.conn.WriteTo(msgBytes, destIP); err != nil {
-				return err
-			}
-			packetsSent++
-			p.wg.Add(1)
-
-			sentMap[sequence] = sentAt
-
-			p.packetsSent.Store(destIP.String(), packetInfo{
-				sentAt:      sentMap,
-				packetsSent: packetsSent,
-				ip:          destIP.String(),
-			})
-		}
-	}
-
-	return nil
-}
-
-func (p *Pinger) finish() {
-	handler := p.onFinish
-	for pkt := range p.finished {
-		if handler == nil {
-			continue
-		}
-		handler(pkt.statistics())
-	}
-
-	if handler == nil {
-		return
-	}
-
-	rcvd := p.packetsRcvd.Copy()
-	for k, v := range p.packetsSent.Copy() {
-		if info, ok := rcvd[k]; ok {
-			info.packetsSent = v.packetsSent
-			handler(info.statistics())
-		} else {
-			handler(v.statistics())
-		}
-	}
-}
-
-// statistics returns stats for received ping packets.
-func (v packetInfo) statistics() *Statistics {
-	loss := float64(v.packetsSent-v.packetsRcvd) / float64(v.packetsSent) * 100
-
-	var min, max, total time.Duration
-	if len(v.rtts) > 0 {
-		min = v.rtts[0]
-		max = v.rtts[0]
-	}
-	for _, rtt := range v.rtts {
-		if rtt < min {
-			min = rtt
-		}
-		if rtt > max {
-			max = rtt
-		}
-		total += rtt
-	}
-
-	s := &Statistics{
-		PacketsSent: v.packetsSent,
-		PacketsRecv: v.packetsRcvd,
-		PacketLoss:  loss,
-		RTTs:        v.rtts,
-		Addr:        v.ip,
-		MaxRTT:      max,
-		MinRTT:      min,
-	}
-
-	if len(v.rtts) > 0 {
-		s.AvgRTT = total / time.Duration(len(v.rtts))
-		var sumsquares time.Duration
-		for _, rtt := range v.rtts {
-			sumsquares += (rtt - s.AvgRTT) * (rtt - s.AvgRTT)
-		}
-		s.StdDevRTT = time.Duration(math.Sqrt(float64(sumsquares / time.Duration(len(v.rtts)))))
-	}
-
-	return s
 }

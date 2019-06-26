@@ -2,10 +2,7 @@
 
 [![GoDoc](https://godoc.org/github.com/glinton/ping?status.svg)](https://godoc.org/github.com/glinton/ping)
 
-Concurrent-first ping (ICMP) library for go.
-
-Inspired by [go-ping](https://github.com/sparrc/go-ping)
-
+Simple (ICMP) library patterned after net/http.
 
 ### OS Specific Notes
 
@@ -15,18 +12,12 @@ Since this library can utilize unprivileged raw sockets on Linux and Darwin (`ud
 
 To allow a range of groups access to create icmp sockets on linux (ipv4 or ipv6), run:
 ```
-sudo sysctl -w net.ipv4.ping_group_range="GROUPID_START   GROUPID_END"
+sudo sysctl -w net.ipv4.ping_group_range="GROUPID_START GROUPID_END"
 ```
 
 If you plan to run your application as `root`, the aforementioned commmand is not necessary.
 
 #### Windows
-
-When running on Windows, you must call `Listen` with either `ip4:icmp` or `ip6:ipv6-icmp` as the network to avoid receiving the following error:
-
-```
-Error listening for ICMP packets: socket: The requested protocol has not been configured into the system, or no implementation for it exists.
-```
 
 Running a terminal as admin should not be necessary.
 
@@ -36,4 +27,3 @@ Running a terminal as admin should not be necessary.
 There is currently no support for TTL on windows, track progress at https://github.com/golang/go/issues/7175 and https://github.com/golang/go/issues/7174
 
 Report any other issues you may find [here](https://github.com/glinton/ping/issues/new)
-
