@@ -23,33 +23,30 @@ const (
 
 // A Request represents an icmp echo request to be sent by a client.
 type Request struct {
-	reqTex  *sync.Mutex // request lock
-	sentAt  time.Time   // time at which echo request was sent
-	dst     net.Addr    // useable destination address
-	proto   int         // icmp protocol (4 or 6)
-	network string      // one of 'ip4:icmp', 'ip6:ipv6-icmp', 'udp4', or 'udp6' for privileged/non-privileged datagrams
+	reqTex *sync.Mutex // request lock
+	sentAt time.Time   // time at which echo request was sent
+	dst    net.Addr    // useable destination address
 
-	ID   int    // icmp.Echo.ID - for differentiating pin. if not set manually, do automatically. an identifier to aid in matching echos and replies, may be zero.
-	Seq  int    // Seq is the ICMP sequence number. a sequence number to aid in matching echos and replies, may be zero.
-	Data []byte // maybe don't want to do this, too much freedom. if so, limit size. used to set icmp.Echo.Data
-
-	Dst net.IP // The address of the host to which the message should be sent.
-	Src net.IP // The address of the host that composes the ICMP message.
+	ID   int    // ID is the ICMP ID. It is an identifier to aid in matching echos and replies when using privileged datagrams, may be zero.
+	Seq  int    // Seq is the ICMP sequence number.
+	Data []byte // Data is generally an arbitrary byte string of size 56. It is used to set icmp.Echo.Data.
+	Dst  net.IP // The address of the host to which the message should be sent.
+	Src  net.IP // The address of the host that composes the ICMP message.
 }
 
 // Response represents an icmp echo response received by a client.
 type Response struct {
 	rcvdAt time.Time // time at which echo response was received
 
-	TotalLength int           // Length of internet header and data in octets.
-	TTL         int           // Time to live in seconds; as this field is decremented at each machine in which the datagram is processed, the value in this field should be at least as great as the number of gateways which this datagram will traverse. Maximum possible value of this field is 255.
-	Src         net.IP        // The address of the host that composed the ICMP message.
-	Dst         net.IP        // The address of the host to which the message was received from.
+	TotalLength int           // Length of internet header and data of the echo response in octets.
 	RTT         time.Duration // RTT is the round-trip time it took to ping.
+	TTL         int           // Time to live in seconds; as this field is decremented at each machine in which the datagram is processed, the value in this field should be at least as great as the number of gateways which this datagram will traverse. Maximum possible value of this field is 255.
 
-	ID   int    // icmp.Echo.ID - for differentiating pin. if not set manually, do automatically. an identifier to aid in matching echos and replies, may be zero.
-	Seq  uint   // Seq is the ICMP sequence number. a sequence number to aid in matching echos and replies, may be zero.
-	Data []byte // maybe don't want to do this, too much freedom. if so, limit size. used to set icmp.Echo.Data
+	ID   int    // ID is the ICMP ID. It is an identifier to aid in matching echos and replies when using privileged datagrams, may be zero.
+	Seq  uint   // Seq is the ICMP sequence number.
+	Data []byte // Data is the body of the ICMP response.
+	Dst  net.IP // The local address of the host that composed the echo request.
+	Src  net.IP // The address of the host to which the message was received from.
 
 	Req *Request // Req is the request that elicited this response.
 }
@@ -59,12 +56,13 @@ type Client struct{}
 
 // Do sends a ping request and returns a ping response.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
-	req.reqTex = &sync.Mutex{}
+	reqTex := &sync.Mutex{}
 
-	conn, err := c.listen(&req)
+	conn, network, err := c.listen(req)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
 	var addr net.Addr
 	if req.isIPv6() {
@@ -75,8 +73,9 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	req.dst = addr
 
-	switch req.network {
+	switch network {
 	case "udp4", "udp6":
 		if a, ok := addr.(*net.IPAddr); ok {
 			req.dst = &net.UDPAddr{IP: a.IP, Zone: a.Zone}
@@ -98,16 +97,19 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 			return
 		}
 
-		req.reqTex.Lock()
-		resp.Req = &req
+		reqTex.Lock()
 		resp.RTT = resp.rcvdAt.Sub(req.sentAt)
-		req.reqTex.Unlock()
+		reqTex.Unlock()
+		resp.Req = &req
 	}()
 
-	err = send(ctx, conn, &req)
+	sentAt, err := send(ctx, conn, req)
 	if err != nil {
 		return nil, err
 	}
+	reqTex.Lock()
+	req.sentAt = sentAt
+	reqTex.Unlock()
 
 	wg.Wait()
 	if readErr != nil {
@@ -119,13 +121,11 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 
 // listen tries first to create a privileged datagram-oriented ICMP endpoint then
 // attempts to create a non-privileged one. If both fail, it returns an error.
-func (c *Client) listen(req *Request) (*icmp.PacketConn, error) {
-	req.network = "ip4:icmp"
-	req.proto = ProtocolIPv4ICMP
+func (c *Client) listen(req Request) (*icmp.PacketConn, string, error) {
+	network := "ip4:icmp"
 
 	if req.isIPv6() {
-		req.proto = ProtocolIPv6ICMP
-		req.network = "ip6:ipv6-icmp"
+		network = "ip6:ipv6-icmp"
 	}
 
 	srcIP := req.Src.String()
@@ -133,21 +133,21 @@ func (c *Client) listen(req *Request) (*icmp.PacketConn, error) {
 		srcIP = ""
 	}
 
-	conn, err := icmp.ListenPacket(req.network, srcIP)
+	conn, err := icmp.ListenPacket(network, srcIP)
 	if err != nil {
-		req.network = "udp4"
+		network = "udp4"
 		if req.isIPv6() {
-			req.network = "udp6"
+			network = "udp6"
 		}
 
 		var err2 error
-		conn, err2 = icmp.ListenPacket(req.network, srcIP)
+		conn, err2 = icmp.ListenPacket(network, srcIP)
 		if err2 != nil {
-			return nil, fmt.Errorf("error listening for ICMP packets: %s: %s", err.Error(), err2.Error())
+			return nil, "", fmt.Errorf("error listening for ICMP packets: %s: %s", err.Error(), err2.Error())
 		}
 	}
 
-	return conn, nil
+	return conn, network, nil
 }
 
 func (req *Request) isIPv6() bool {
@@ -155,6 +155,13 @@ func (req *Request) isIPv6() bool {
 		return false
 	}
 	return true
+}
+
+func (req *Request) proto() int {
+	if req.isIPv6() {
+		return ProtocolIPv6ICMP
+	}
+	return ProtocolIPv4ICMP
 }
 
 func read(ctx context.Context, conn *icmp.PacketConn) (*Response, error) {
@@ -174,7 +181,7 @@ func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
-			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 300))
+			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 			bytesReceived := make([]byte, 1500)
 
 			n, cm, src, err := conn.ReadFrom(bytesReceived)
@@ -239,7 +246,7 @@ func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
-			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 300))
+			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 			bytesReceived := make([]byte, 1500)
 
 			n, cm, src, err := conn.ReadFrom(bytesReceived)
@@ -305,10 +312,11 @@ func (req *Request) data() []byte {
 	return req.Data
 }
 
-func send(ctx context.Context, conn *icmp.PacketConn, req *Request) error {
+func send(ctx context.Context, conn *icmp.PacketConn, req Request) (time.Time, error) {
+	sentAt := time.Time{}
 	select {
 	case <-ctx.Done():
-		return nil
+		return sentAt, nil
 	default:
 		body := &icmp.Echo{
 			ID:   req.ID,
@@ -322,7 +330,7 @@ func send(ctx context.Context, conn *icmp.PacketConn, req *Request) error {
 			Body: body,
 		}
 
-		if req.proto == ProtocolIPv4ICMP {
+		if req.proto() == ProtocolIPv4ICMP {
 			msg.Type = ipv4.ICMPTypeEcho
 			conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
 		} else {
@@ -331,22 +339,19 @@ func send(ctx context.Context, conn *icmp.PacketConn, req *Request) error {
 
 		msgBytes, err := msg.Marshal(nil)
 		if err != nil {
-			return err
+			return sentAt, err
 		}
 
 		if timeout, ok := ctx.Deadline(); ok {
 			if err := conn.SetWriteDeadline(timeout); err != nil {
-				return err
+				return sentAt, err
 			}
 		}
-
 		if _, err := conn.WriteTo(msgBytes, req.dst); err != nil {
-			return err
+			return sentAt, err
 		}
-		req.reqTex.Lock()
-		req.sentAt = time.Now()
-		req.reqTex.Unlock()
+		sentAt = time.Now()
 	}
 
-	return nil
+	return sentAt, nil
 }

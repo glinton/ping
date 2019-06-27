@@ -75,6 +75,11 @@ func main() {
 
 	fmt.Printf("PING %s (%s) %d bytes of data.\n", destination, host.String(), len(data))
 
+	req := ping.Request{
+		Dst:  net.ParseIP(host.String()),
+		Src:  net.ParseIP(getAddr(*iface)),
+		Data: data,
+	}
 	for *count == 0 || packetsSent < *count {
 		select {
 		case <-ctx.Done():
@@ -85,14 +90,10 @@ func main() {
 
 			packetsSent++
 			wg.Add(1)
-			go func(seq int) {
+			go func(req ping.Request, seq int) {
 				defer wg.Done()
-				resp, err := c.Do(ctx, ping.Request{
-					Dst:  net.ParseIP(host.String()),
-					Src:  net.ParseIP(getAddr(*iface)),
-					Seq:  seq,
-					Data: data,
-				})
+				req.Seq = seq
+				resp, err := c.Do(ctx, req)
 				if err != nil {
 					fmt.Println("failed to ping:", err)
 					return
@@ -100,7 +101,7 @@ func main() {
 
 				resps <- resp
 				onRcv(resp, name)
-			}(packetsSent)
+			}(req, packetsSent)
 		}
 	}
 
