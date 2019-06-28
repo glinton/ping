@@ -54,6 +54,14 @@ type Response struct {
 // Client is a ping client.
 type Client struct{}
 
+// DefaultClient is the default client used by Do.
+var DefaultClient = &Client{}
+
+// Do sends a ping request using the default client and returns a ping response.
+func Do(ctx context.Context, req Request) (*Response, error) {
+	return DefaultClient.Do(ctx, req)
+}
+
 // Do sends a ping request and returns a ping response.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	reqTex := &sync.Mutex{}
