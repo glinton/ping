@@ -93,7 +93,7 @@ func main() {
 			go func(req ping.Request, seq int) {
 				defer wg.Done()
 				req.Seq = seq
-				resp, err := c.Do(ctx, req)
+				resp, err := c.Do(ctx, &req)
 				if err != nil {
 					fmt.Println("failed to ping:", err)
 					return

@@ -5,6 +5,43 @@
 Simple (ICMP) library patterned after net/http.
 
 
+### Installation
+
+```sh
+go get -du github.com/glinton/ping
+```
+
+To install an all-go iputils patterned `ping` binary
+```sh
+go get github.com/glinton/ping/cmd/ping
+# to run:
+$GOPATH/bin/ping localhost
+```
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/glinton/ping"
+)
+
+func main() {
+	res, err := ping.IPv4(context.Background(), "google.com")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Completed one ping to google.com with %d bytes in %v\n",
+		res.TotalLength, res.RTT)
+}
+```
+
+
 ### Notes Regarding ICMP Socket Permissions
 
 System installed `ping` binaries generally have `setuid` attributes set, thus allowing them to utilize privileged ICMP sockets. This should work for applications built with this library as well, but a better approach would be to give the application the capability to create privileged ICMP sockets. To do so, run the following as the `root` user (not applicable to Windows).

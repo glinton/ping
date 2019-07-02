@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	// ProtocolIPv4ICMP defines ICMP for IPv4.
-	ProtocolIPv4ICMP = 1
-	// ProtocolIPv6ICMP defines ICMP for IPv6.
-	ProtocolIPv6ICMP = 58
+	// protocolIPv4ICMP defines ICMP for IPv4.
+	protocolIPv4ICMP = 1
+	// protocolIPv6ICMP defines ICMP for IPv6.
+	protocolIPv6ICMP = 58
 )
 
 // A Request represents an icmp echo request to be sent by a client.
@@ -57,13 +57,35 @@ type Client struct{}
 // DefaultClient is the default client used by Do.
 var DefaultClient = &Client{}
 
+// NewRequest resolves dst as an IPv4 address and returns a pointer to a request
+// using that as the destination.
+func NewRequest(dst string) (*Request, error) {
+	host, err := net.ResolveIPAddr("ip4", dst)
+	if err != nil {
+		return nil, fmt.Errorf("can't resolve host: %s", err.Error())
+	}
+
+	return &Request{Dst: net.ParseIP(host.String())}, nil
+}
+
+// NewRequest6 resolves dst as an IPv6 address and returns a pointer to a request
+// using that as the destination.
+func NewRequest6(dst string) (*Request, error) {
+	host, err := net.ResolveIPAddr("ip6", dst)
+	if err != nil {
+		return nil, fmt.Errorf("can't resolve host: %s", err.Error())
+	}
+
+	return &Request{Dst: net.ParseIP(host.String())}, nil
+}
+
 // Do sends a ping request using the default client and returns a ping response.
-func Do(ctx context.Context, req Request) (*Response, error) {
+func Do(ctx context.Context, req *Request) (*Response, error) {
 	return DefaultClient.Do(ctx, req)
 }
 
 // Do sends a ping request and returns a ping response.
-func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
+func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 	reqTex := &sync.Mutex{}
 
 	conn, network, err := c.listen(req)
@@ -108,7 +130,7 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		reqTex.Lock()
 		resp.RTT = resp.rcvdAt.Sub(req.sentAt)
 		reqTex.Unlock()
-		resp.Req = &req
+		resp.Req = req
 	}()
 
 	sentAt, err := send(ctx, conn, req)
@@ -127,9 +149,29 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	return resp, nil
 }
 
+// IPv4 resolves dst as an IPv4 address and pings using DefaultClient, returning
+// the response and error.
+func IPv4(ctx context.Context, dst string) (*Response, error) {
+	req, err := NewRequest(dst)
+	if err != nil {
+		return nil, err
+	}
+	return Do(ctx, req)
+}
+
+// IPv6 resolves dst as an IPv6 address and pings using DefaultClient, returning
+// the response and error.
+func IPv6(ctx context.Context, dst string) (*Response, error) {
+	req, err := NewRequest6(dst)
+	if err != nil {
+		return nil, err
+	}
+	return Do(ctx, req)
+}
+
 // listen tries first to create a privileged datagram-oriented ICMP endpoint then
 // attempts to create a non-privileged one. If both fail, it returns an error.
-func (c *Client) listen(req Request) (*icmp.PacketConn, string, error) {
+func (c *Client) listen(req *Request) (*icmp.PacketConn, string, error) {
 	network := "ip4:icmp"
 
 	if req.isIPv6() {
@@ -167,9 +209,9 @@ func (req *Request) isIPv6() bool {
 
 func (req *Request) proto() int {
 	if req.isIPv6() {
-		return ProtocolIPv6ICMP
+		return protocolIPv6ICMP
 	}
-	return ProtocolIPv4ICMP
+	return protocolIPv4ICMP
 }
 
 func read(ctx context.Context, conn *icmp.PacketConn) (*Response, error) {
@@ -209,7 +251,7 @@ func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
 				continue
 			}
 
-			m, err := icmp.ParseMessage(ProtocolIPv4ICMP, bytesReceived[:n])
+			m, err := icmp.ParseMessage(protocolIPv4ICMP, bytesReceived[:n])
 			if err != nil {
 				return nil, err
 			}
@@ -274,7 +316,7 @@ func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
 				continue
 			}
 
-			m, err := icmp.ParseMessage(ProtocolIPv6ICMP, bytesReceived[:n])
+			m, err := icmp.ParseMessage(protocolIPv6ICMP, bytesReceived[:n])
 			if err != nil {
 				return nil, err
 			}
@@ -320,7 +362,7 @@ func (req *Request) data() []byte {
 	return req.Data
 }
 
-func send(ctx context.Context, conn *icmp.PacketConn, req Request) (time.Time, error) {
+func send(ctx context.Context, conn *icmp.PacketConn, req *Request) (time.Time, error) {
 	sentAt := time.Time{}
 	select {
 	case <-ctx.Done():
@@ -338,7 +380,7 @@ func send(ctx context.Context, conn *icmp.PacketConn, req Request) (time.Time, e
 			Body: body,
 		}
 
-		if req.proto() == ProtocolIPv4ICMP {
+		if req.proto() == protocolIPv4ICMP {
 			msg.Type = ipv4.ICMPTypeEcho
 			conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
 		} else {

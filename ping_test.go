@@ -1,4 +1,4 @@
-package ping
+package ping_test
 
 import (
 	"context"
@@ -8,10 +8,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/glinton/ping"
 )
 
 func TestE2E(t *testing.T) {
-	c := &Client{}
+	c := &ping.Client{}
 
 	hostIPs := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1"}
 	count := 3
@@ -32,7 +34,7 @@ func TestE2E(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), deadline)
 			defer cancel()
 
-			resps := make(chan *Response, count)
+			resps := make(chan *ping.Response, count)
 			packetsSent := 0
 
 			for count == 0 || packetsSent < count {
@@ -48,7 +50,7 @@ func TestE2E(t *testing.T) {
 					wg.Add(1)
 					go func(seq int) {
 						defer wg.Done()
-						resp, err := c.Do(ctx, Request{
+						resp, err := c.Do(ctx, &ping.Request{
 							Dst: net.ParseIP(host),
 							Seq: seq,
 						})
@@ -66,7 +68,7 @@ func TestE2E(t *testing.T) {
 			wg.Wait()
 			close(resps)
 
-			rsps := []*Response{}
+			rsps := []*ping.Response{}
 			for res := range resps {
 				rsps = append(rsps, res)
 			}
@@ -77,12 +79,12 @@ func TestE2E(t *testing.T) {
 	pwg.Wait()
 }
 
-func onRcv(res *Response) {
+func onRcv(res *ping.Response) {
 	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v\n",
 		res.TotalLength, res.Src.String(), res.Seq, res.RTT, res.TTL)
 }
 
-func onFin(packetsSent int, resps []*Response) {
+func onFin(packetsSent int, resps []*ping.Response) {
 	if len(resps) == 0 {
 		fmt.Println("Sent:", packetsSent, "Received: 0")
 		return
@@ -114,4 +116,48 @@ func onFin(packetsSent int, resps []*Response) {
 		packetsSent, len(resps), float64(packetsSent-len(resps))/float64(packetsSent)*100)
 	fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n",
 		min, avg, max, stdDev)
+}
+
+func ExampleDo() {
+	req, err := ping.NewRequest("localhost")
+	if err != nil {
+		panic(err)
+	}
+
+	res, err := ping.Do(context.Background(), req)
+	if err != nil {
+		panic(err)
+	}
+
+	// RTT is the time from an ICMP echo request to the time a reply is received.
+	fmt.Println(res.RTT)
+}
+
+func ExampleIPv4() {
+	res, err := ping.IPv4(context.Background(), "google.com")
+	if err != nil {
+		panic(err)
+	}
+
+	// RTT is the time from an ICMP echo request to the time a reply is received.
+	fmt.Println(res.RTT)
+}
+
+func ExampleNewRequest_withSource() {
+	req, err := ping.NewRequest("localhost")
+	if err != nil {
+		panic(err)
+	}
+
+	// If you have multiple interfaces spanning different networks
+	// and want to ping from a specific interface, set the source.
+	req.Src = net.ParseIP("127.0.0.2")
+
+	res, err := ping.Do(context.Background(), req)
+	if err != nil {
+		panic(err)
+	}
+
+	// RTT is the time from an ICMP echo request to the time a reply is received.
+	fmt.Println(res.RTT)
 }
