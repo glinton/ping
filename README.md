@@ -4,6 +4,8 @@
 
 Simple (ICMP) library patterned after net/http.
 
+Originally inspired by [sparrc/go-ping](https://github.com/sparrc/go-ping)
+
 
 ### Installation
 
@@ -50,7 +52,7 @@ System installed `ping` binaries generally have `setuid` attributes set, thus al
 setcap cap_net_raw=eip /path/to/your/application
 ```
 
-Since this library can utilize unprivileged raw sockets on Linux and Darwin (`udp4` or `udp6` as the network). On Linux, the system group of the user running the application must be allowed to create unprivileged ICMP sockets. [See man pages icmp(7) for `ping_group_range`](http://man7.org/linux/man-pages/man7/icmp.7.html).
+This library tries to initialize a privileged ICMP socket before falling back to unprivileged raw sockets on Linux and Darwin (`udp4` or `udp6` as the network). On Linux, the system group of the user running the application must be allowed to create unprivileged ICMP sockets if desired. [See man pages icmp(7) for `ping_group_range`](http://man7.org/linux/man-pages/man7/icmp.7.html).
 
 To allow a range of groups access to create unprivileged icmp sockets on linux (ipv4 or ipv6), run:
 

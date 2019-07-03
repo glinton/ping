@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/glinton/ping"
@@ -18,11 +21,11 @@ func main() {
 	ipv4 := flag.Bool("-4", false, "")
 	ipv6 := flag.Bool("-6", false, "")
 	count := flag.Int("c", 0, "")
-	interval := flag.Duration("i", time.Second, "")
+	interval := flag.Float64("i", 1, "")
 	iface := flag.String("I", "", "")
 	size := flag.Int("-s", 0, "")
-	deadline := flag.Duration("w", time.Millisecond*5000, "")
-	timeout := flag.Duration("W", time.Second, "")
+	deadline := flag.Float64("w", 0, "")
+	timeout := flag.Float64("W", 1, "")
 
 	flag.Usage = func() {
 		fmt.Print(usage)
@@ -52,12 +55,28 @@ func main() {
 		return
 	}
 
-	tick := time.NewTicker(*interval)
-	defer tick.Stop()
+	fmt.Printf("PING %s (%s) %d bytes of data.\n", destination, host.String(), len(data))
+
+	ctx := term(context.Background())
 
 	wg := &sync.WaitGroup{}
-	ctx, cancel := context.WithTimeout(context.Background(), *deadline)
-	defer cancel()
+	var cancel context.CancelFunc
+	if *deadline > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(*deadline*float64(time.Second)))
+		defer cancel()
+	}
+
+	if *timeout <= 0 {
+		*timeout = 2
+	}
+
+	if *interval < .2 {
+		fmt.Println("ping: cannot flood; minimal interval allowed for user is 200ms")
+		return
+	}
+
+	tick := time.NewTicker(time.Duration(*interval * float64(time.Second)))
+	defer tick.Stop()
 
 	chanLength := 100
 	if *count > 0 {
@@ -73,8 +92,6 @@ func main() {
 		name = strings.TrimSuffix(names[0], ".")
 	}
 
-	fmt.Printf("PING %s (%s) %d bytes of data.\n", destination, host.String(), len(data))
-
 	req := ping.Request{
 		Dst:  net.ParseIP(host.String()),
 		Src:  net.ParseIP(getAddr(*iface)),
@@ -85,7 +102,7 @@ func main() {
 		case <-ctx.Done():
 			goto finish
 		case <-tick.C:
-			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout*float64(time.Second)))
 			defer cancel()
 
 			packetsSent++
@@ -209,6 +226,25 @@ func getAddr(ipOrIface string) string {
 	return ""
 }
 
+// Handle signals in the fanciest way. Thanks to:
+// https://github.com/influxdata/influxdb/blob/v2.0.0-alpha.14/kit/signals/context.go
+func term(ctx context.Context) context.Context {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigCh:
+			return
+		}
+	}()
+	return ctx
+}
+
 var usage = `
 NAME
        ping - send ICMP ECHO_REQUEST to network hosts
@@ -220,8 +256,8 @@ SYNOPSIS
 DESCRIPTION
        ping uses the ICMP protocol's mandatory ECHO_REQUEST datagram to elicit
        an ICMP ECHO_RESPONSE from a host or gateway. ECHO_REQUEST datagrams
-       (pings) have an IP and ICMP header, followed by a struct timeval and
-       then an arbitrary number of padbytes used to fill out the packet.
+			 (pings) have an IP and ICMP header, followed by an arbitrary number
+			 of padbytes used to fill out the packet.
 
        ping works with both IPv4 and IPv6. Using only one of them explicitly
        can be enforced by specifying -4 or -6.
@@ -266,8 +302,7 @@ OPTIONS
 
        -W timeout
            Time to wait for a response, in seconds. The option affects only
-           timeout in absence of any responses, otherwise ping waits for two
-           seconds.
+           timeout in absence of any responses.
 
 EXAMPLES
        # ping google continuously
@@ -277,8 +312,8 @@ EXAMPLES
        ping -c 5 www.google.com
 
        # ping google 5 times at 500ms intervals
-       ping -c 5 -i 500ms www.google.com
+       ping -c 5 -i .5 www.google.com
 
        # ping google for 10 seconds
-       ping -w 10s www.google.com
+       ping -w 10 www.google.com
 `
