@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -23,9 +22,8 @@ const (
 
 // A Request represents an icmp echo request to be sent by a client.
 type Request struct {
-	reqTex *sync.Mutex // request lock
-	sentAt time.Time   // time at which echo request was sent
-	dst    net.Addr    // useable destination address
+	sentAt time.Time // time at which echo request was sent
+	dst    net.Addr  // useable destination address
 
 	ID   int    // ID is the ICMP ID. It is an identifier to aid in matching echos and replies when using privileged datagrams, may be zero.
 	Seq  int    // Seq is the ICMP sequence number.
@@ -86,8 +84,6 @@ func Do(ctx context.Context, req *Request) (*Response, error) {
 
 // Do sends a ping request and returns a ping response.
 func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
-	reqTex := &sync.Mutex{}
-
 	conn, network, err := c.listen(req)
 	if err != nil {
 		return nil, err
@@ -115,33 +111,22 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 	var (
 		resp    *Response
 		readErr error
-
-		wg = &sync.WaitGroup{}
 	)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		resp, readErr = read(ctx, conn)
-		if readErr != nil {
-			return
-		}
-
-		reqTex.Lock()
-		resp.RTT = resp.rcvdAt.Sub(req.sentAt)
-		reqTex.Unlock()
-		resp.Req = req
-	}()
 
 	sentAt, err := send(ctx, conn, req)
 	if err != nil {
 		return nil, err
 	}
-	reqTex.Lock()
-	req.sentAt = sentAt
-	reqTex.Unlock()
 
-	wg.Wait()
+	resp, readErr = read(ctx, conn)
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	resp.RTT = resp.rcvdAt.Sub(sentAt)
+	req.sentAt = sentAt
+	resp.Req = req
+
 	if readErr != nil {
 		return nil, readErr
 	}
