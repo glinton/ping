@@ -1,4 +1,4 @@
-package ping_test
+package ping
 
 import (
 	"context"
@@ -8,13 +8,45 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/glinton/ping"
 )
 
-func TestE2E(t *testing.T) {
-	c := &ping.Client{}
+func TestClient(t *testing.T) {
+	req1, err := NewRequest("www.baidu.com")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	req1.ID = 101
+	req1.Seq = 201
 
+	req2 := *req1
+	req2.ID = 102
+	req2.Seq = 202
+
+	req3 := *req1
+	req3.ID = 103
+	req3.Seq = 203
+
+	wg := new(sync.WaitGroup)
+	wg.Add(3)
+	go testClient(t, wg, req1)
+	go testClient(t, wg, &req2)
+	go testClient(t, wg, &req3)
+	wg.Wait()
+}
+
+func testClient(t *testing.T, wg *sync.WaitGroup, req *Request) {
+	defer wg.Done()
+
+	resp, err := Do(context.Background(), req)
+	if err != nil {
+		t.Error(err)
+	} else if resp.ID != req.ID || int(resp.Seq) != req.Seq {
+		t.Error(req, resp)
+	}
+}
+
+func TestE2E(t *testing.T) {
 	hostIPs := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1"}
 	count := 3
 	deadline := time.Second * 5
@@ -34,7 +66,7 @@ func TestE2E(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), deadline)
 			defer cancel()
 
-			resps := make(chan *ping.Response, count)
+			resps := make(chan *Response, count)
 			packetsSent := 0
 
 			for count == 0 || packetsSent < count {
@@ -50,7 +82,7 @@ func TestE2E(t *testing.T) {
 					wg.Add(1)
 					go func(seq int) {
 						defer wg.Done()
-						resp, err := c.Do(ctx, &ping.Request{
+						resp, err := DefaultClient.Do(ctx, &Request{
 							Dst: net.ParseIP(host),
 							Seq: seq,
 						})
@@ -68,7 +100,7 @@ func TestE2E(t *testing.T) {
 			wg.Wait()
 			close(resps)
 
-			rsps := []*ping.Response{}
+			rsps := []*Response{}
 			for res := range resps {
 				rsps = append(rsps, res)
 			}
@@ -79,12 +111,12 @@ func TestE2E(t *testing.T) {
 	pwg.Wait()
 }
 
-func onRcv(res *ping.Response) {
+func onRcv(res *Response) {
 	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v\n",
 		res.TotalLength, res.Src.String(), res.Seq, res.RTT, res.TTL)
 }
 
-func onFin(packetsSent int, resps []*ping.Response) {
+func onFin(packetsSent int, resps []*Response) {
 	if len(resps) == 0 {
 		fmt.Println("Sent:", packetsSent, "Received: 0")
 		return
@@ -119,12 +151,12 @@ func onFin(packetsSent int, resps []*ping.Response) {
 }
 
 func ExampleDo() {
-	req, err := ping.NewRequest("localhost")
+	req, err := NewRequest("localhost")
 	if err != nil {
 		panic(err)
 	}
 
-	res, err := ping.Do(context.Background(), req)
+	res, err := Do(context.Background(), req)
 	if err != nil {
 		panic(err)
 	}
@@ -134,7 +166,7 @@ func ExampleDo() {
 }
 
 func ExampleIPv4() {
-	res, err := ping.IPv4(context.Background(), "google.com")
+	res, err := IPv4(context.Background(), "google.com")
 	if err != nil {
 		panic(err)
 	}
@@ -144,7 +176,7 @@ func ExampleIPv4() {
 }
 
 func ExampleNewRequest_withSource() {
-	req, err := ping.NewRequest("localhost")
+	req, err := NewRequest("localhost")
 	if err != nil {
 		panic(err)
 	}
@@ -153,7 +185,7 @@ func ExampleNewRequest_withSource() {
 	// and want to ping from a specific interface, set the source.
 	req.Src = net.ParseIP("127.0.0.2")
 
-	res, err := ping.Do(context.Background(), req)
+	res, err := Do(context.Background(), req)
 	if err != nil {
 		panic(err)
 	}
