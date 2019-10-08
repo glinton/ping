@@ -117,27 +117,18 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		}
 	}
 
-	var (
-		resp    *Response
-		readErr error
-	)
-
 	sentAt, err := send(ctx, conn, req)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, readErr = read(ctx, conn, req, c.CheckResponse)
-	if readErr != nil {
-		return nil, readErr
+	resp, err := read(ctx, conn, req, c.CheckResponse)
+	if err != nil {
+		return nil, err
 	}
 
 	resp.RTT = resp.rcvdAt.Sub(sentAt)
 	req.sentAt = sentAt
-
-	if readErr != nil {
-		return nil, readErr
-	}
 
 	return resp, nil
 }
