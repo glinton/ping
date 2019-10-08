@@ -269,8 +269,16 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, req *Request,
 				ttl = cm.TTL
 			}
 
-			srcHost, _, _ := net.SplitHostPort(src.String())
-			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+			srcHost, _, err := net.SplitHostPort(src.String())
+			if err != nil {
+				srcHost = src.String()
+			}
+
+			dstHost, _, err := net.SplitHostPort(conn.LocalAddr().String())
+			if err != nil {
+				dstHost = conn.LocalAddr().String()
+			}
+
 			resp := &Response{
 				Req:         req,
 				ID:          id,
@@ -339,8 +347,16 @@ func read6(ctx context.Context, conn *ipv6.PacketConn, req *Request,
 				ttl = cm.HopLimit
 			}
 
-			srcHost, _, _ := net.SplitHostPort(src.String())
-			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+			srcHost, _, err := net.SplitHostPort(src.String())
+			if err != nil {
+				srcHost = src.String()
+			}
+
+			dstHost, _, err := net.SplitHostPort(conn.LocalAddr().String())
+			if err != nil {
+				dstHost = conn.LocalAddr().String()
+			}
+
 			resp := &Response{
 				Req:         req,
 				ID:          id,
