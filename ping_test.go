@@ -49,6 +49,8 @@ func testClient(t *testing.T, wg *sync.WaitGroup, req *ping.Request) {
 }
 
 func TestE2E(t *testing.T) {
+	c := &ping.Client{}
+
 	hostIPs := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1"}
 	count := 3
 	deadline := time.Second * 5
@@ -84,7 +86,7 @@ func TestE2E(t *testing.T) {
 					wg.Add(1)
 					go func(seq int) {
 						defer wg.Done()
-						resp, err := ping.DefaultClient.Do(ctx, &ping.Request{
+						resp, err := c.Do(ctx, &ping.Request{
 							Dst: net.ParseIP(host),
 							Seq: seq,
 						})
