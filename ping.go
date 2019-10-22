@@ -222,20 +222,25 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, req *Request) (*Response,
 				return nil, err
 			}
 
-			if cm == nil || n <= 0 || cm.Src.String() != req.Dst.String() {
+			// If there was no data read or the packet didn't originate from the host
+			// assumed, skip processing.
+			if n <= 0 || cm.Src.String() != req.Dst.String() {
 				continue
 			}
 
+			// Process the data as an icmp message.
 			m, err := icmp.ParseMessage(protocolIPv4ICMP, bytesReceived[:n])
 			if err != nil {
 				return nil, err
 			}
 
+			// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
 			if m.Type != ipv4.ICMPTypeEchoReply {
-				// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
 				continue
 			}
 
+			// Verify the sequence numbers match our expectations for correct rtt.
+			// If using `ip4:icmp`, the ID can be verified as well (preferred).
 			b, ok := m.Body.(*icmp.Echo)
 			if !ok || b.Seq != req.Seq {
 				continue
@@ -279,20 +284,25 @@ func read6(ctx context.Context, conn *ipv6.PacketConn, req *Request) (*Response,
 				return nil, err
 			}
 
-			if cm == nil || n <= 0 || cm.Src.String() != req.Dst.String() {
+			// If there was no data read or the packet didn't originate from the host
+			// assumed, skip processing.
+			if n <= 0 || cm.Src.String() != req.Dst.String() {
 				continue
 			}
 
+			// Process the data as an icmp message.
 			m, err := icmp.ParseMessage(protocolIPv6ICMP, bytesReceived[:n])
 			if err != nil {
 				return nil, err
 			}
 
+			// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
 			if m.Type != ipv6.ICMPTypeEchoReply {
-				// Likely an `ICMPTypeDestinationUnreachable`, ignore it.
 				continue
 			}
 
+			// Verify the sequence numbers match our expectations for correct rtt.
+			// If using `ip4:icmp`, the ID can be verified as well (preferred).
 			b, ok := m.Body.(*icmp.Echo)
 			if !ok || b.Seq != req.Seq {
 				continue
