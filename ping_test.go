@@ -1,4 +1,4 @@
-package ping
+package ping_test
 
 import (
 	"context"
@@ -8,10 +8,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/glinton/ping"
 )
 
 func TestClient(t *testing.T) {
-	req1, err := NewRequest("www.baidu.com")
+	req1, err := ping.NewRequest("www.baidu.com")
 	if err != nil {
 		t.Error(err)
 		return
@@ -35,10 +37,10 @@ func TestClient(t *testing.T) {
 	wg.Wait()
 }
 
-func testClient(t *testing.T, wg *sync.WaitGroup, req *Request) {
+func testClient(t *testing.T, wg *sync.WaitGroup, req *ping.Request) {
 	defer wg.Done()
 
-	resp, err := Do(context.Background(), req)
+	resp, err := ping.Do(context.Background(), req)
 	if err != nil {
 		t.Error(err)
 	} else if resp.ID != req.ID || int(resp.Seq) != req.Seq {
@@ -66,7 +68,7 @@ func TestE2E(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), deadline)
 			defer cancel()
 
-			resps := make(chan *Response, count)
+			resps := make(chan *ping.Response, count)
 			packetsSent := 0
 
 			for count == 0 || packetsSent < count {
@@ -82,7 +84,7 @@ func TestE2E(t *testing.T) {
 					wg.Add(1)
 					go func(seq int) {
 						defer wg.Done()
-						resp, err := DefaultClient.Do(ctx, &Request{
+						resp, err := ping.DefaultClient.Do(ctx, &ping.Request{
 							Dst: net.ParseIP(host),
 							Seq: seq,
 						})
@@ -100,7 +102,7 @@ func TestE2E(t *testing.T) {
 			wg.Wait()
 			close(resps)
 
-			rsps := []*Response{}
+			rsps := []*ping.Response{}
 			for res := range resps {
 				rsps = append(rsps, res)
 			}
@@ -111,12 +113,12 @@ func TestE2E(t *testing.T) {
 	pwg.Wait()
 }
 
-func onRcv(res *Response) {
+func onRcv(res *ping.Response) {
 	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v\n",
 		res.TotalLength, res.Src.String(), res.Seq, res.RTT, res.TTL)
 }
 
-func onFin(packetsSent int, resps []*Response) {
+func onFin(packetsSent int, resps []*ping.Response) {
 	if len(resps) == 0 {
 		fmt.Println("Sent:", packetsSent, "Received: 0")
 		return
@@ -151,12 +153,12 @@ func onFin(packetsSent int, resps []*Response) {
 }
 
 func ExampleDo() {
-	req, err := NewRequest("localhost")
+	req, err := ping.NewRequest("localhost")
 	if err != nil {
 		panic(err)
 	}
 
-	res, err := Do(context.Background(), req)
+	res, err := ping.Do(context.Background(), req)
 	if err != nil {
 		panic(err)
 	}
@@ -166,7 +168,7 @@ func ExampleDo() {
 }
 
 func ExampleIPv4() {
-	res, err := IPv4(context.Background(), "google.com")
+	res, err := ping.IPv4(context.Background(), "google.com")
 	if err != nil {
 		panic(err)
 	}
@@ -176,7 +178,7 @@ func ExampleIPv4() {
 }
 
 func ExampleNewRequest_withSource() {
-	req, err := NewRequest("localhost")
+	req, err := ping.NewRequest("localhost")
 	if err != nil {
 		panic(err)
 	}
@@ -185,7 +187,7 @@ func ExampleNewRequest_withSource() {
 	// and want to ping from a specific interface, set the source.
 	req.Src = net.ParseIP("127.0.0.2")
 
-	res, err := Do(context.Background(), req)
+	res, err := ping.Do(context.Background(), req)
 	if err != nil {
 		panic(err)
 	}
