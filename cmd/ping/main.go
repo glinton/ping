@@ -93,6 +93,7 @@ func main() {
 	}
 
 	req := ping.Request{
+		ID:   os.Getpid(),
 		Dst:  net.ParseIP(host.String()),
 		Src:  net.ParseIP(getAddr(*iface)),
 		Data: data,

@@ -12,6 +12,42 @@ import (
 	"github.com/glinton/ping"
 )
 
+func TestClient(t *testing.T) {
+	req1, err := ping.NewRequest("www.baidu.com")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	req1.ID = 101
+	req1.Seq = 201
+
+	req2 := *req1
+	req2.ID = 102
+	req2.Seq = 202
+
+	req3 := *req1
+	req3.ID = 103
+	req3.Seq = 203
+
+	wg := new(sync.WaitGroup)
+	wg.Add(3)
+	go testClient(t, wg, req1)
+	go testClient(t, wg, &req2)
+	go testClient(t, wg, &req3)
+	wg.Wait()
+}
+
+func testClient(t *testing.T, wg *sync.WaitGroup, req *ping.Request) {
+	defer wg.Done()
+
+	resp, err := ping.Do(context.Background(), req)
+	if err != nil {
+		t.Error(err)
+	} else if resp.ID != req.ID || int(resp.Seq) != req.Seq {
+		t.Error(req, resp)
+	}
+}
+
 func TestE2E(t *testing.T) {
 	c := &ping.Client{}
 
