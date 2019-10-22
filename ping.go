@@ -108,28 +108,19 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		}
 	}
 
-	var (
-		resp    *Response
-		readErr error
-	)
-
 	sentAt, err := send(ctx, conn, req)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, readErr = read(ctx, conn)
-	if readErr != nil {
-		return nil, readErr
+	resp, err := read(ctx, conn, req)
+	if err != nil {
+		return nil, err
 	}
 
 	resp.RTT = resp.rcvdAt.Sub(sentAt)
 	req.sentAt = sentAt
 	resp.Req = req
-
-	if readErr != nil {
-		return nil, readErr
-	}
 
 	return resp, nil
 }
@@ -199,18 +190,17 @@ func (req *Request) proto() int {
 	return protocolIPv4ICMP
 }
 
-func read(ctx context.Context, conn *icmp.PacketConn) (*Response, error) {
+func read(ctx context.Context, conn *icmp.PacketConn, req *Request) (*Response, error) {
 	if c4 := conn.IPv4PacketConn(); c4 != nil {
-		return read4(ctx, c4)
+		return read4(ctx, c4, req)
 	}
-	c6 := conn.IPv6PacketConn()
-	if c6 == nil {
-		return nil, errors.New("bad icmp connection type")
+	if c6 := conn.IPv6PacketConn(); c6 != nil {
+		return read6(ctx, c6, req)
 	}
-	return read6(ctx, c6)
+	return nil, errors.New("bad icmp connection type")
 }
 
-func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
+func read4(ctx context.Context, conn *ipv4.PacketConn, req *Request) (*Response, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -232,7 +222,7 @@ func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
 				return nil, err
 			}
 
-			if n <= 0 {
+			if cm == nil || n <= 0 || cm.Src.String() != req.Dst.String() {
 				continue
 			}
 
@@ -246,36 +236,28 @@ func read4(ctx context.Context, conn *ipv4.PacketConn) (*Response, error) {
 				continue
 			}
 
-			var seq uint
-			var id int
 			b, ok := m.Body.(*icmp.Echo)
-			if ok {
-				seq = uint(b.Seq)
-				id = b.ID
-			}
-
-			var ttl int
-			if cm != nil {
-				ttl = cm.TTL
+			if !ok || b.Seq != req.Seq {
+				continue
 			}
 
 			srcHost, _, _ := net.SplitHostPort(src.String())
 			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
 			return &Response{
-				ID:          id,
-				Seq:         seq,
-				Data:        bytesReceived[:n],
+				ID:          b.ID,
+				Seq:         uint(b.Seq),
+				Data:        b.Data,
 				TotalLength: n,
 				Src:         net.ParseIP(srcHost),
 				Dst:         net.ParseIP(dstHost),
-				TTL:         ttl,
+				TTL:         cm.TTL,
 				rcvdAt:      rcv,
 			}, nil
 		}
 	}
 }
 
-func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
+func read6(ctx context.Context, conn *ipv6.PacketConn, req *Request) (*Response, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -297,7 +279,7 @@ func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
 				return nil, err
 			}
 
-			if n <= 0 {
+			if cm == nil || n <= 0 || cm.Src.String() != req.Dst.String() {
 				continue
 			}
 
@@ -311,29 +293,21 @@ func read6(ctx context.Context, conn *ipv6.PacketConn) (*Response, error) {
 				continue
 			}
 
-			var seq uint
-			var id int
 			b, ok := m.Body.(*icmp.Echo)
-			if ok {
-				seq = uint(b.Seq)
-				id = b.ID
-			}
-
-			var ttl int
-			if cm != nil {
-				ttl = cm.HopLimit
+			if !ok || b.Seq != req.Seq {
+				continue
 			}
 
 			srcHost, _, _ := net.SplitHostPort(src.String())
 			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
 			return &Response{
-				ID:          id,
-				Seq:         seq,
+				ID:          b.ID,
+				Seq:         uint(b.Seq),
 				Data:        bytesReceived[:n],
 				TotalLength: n,
 				Src:         net.ParseIP(srcHost),
 				Dst:         net.ParseIP(dstHost),
-				TTL:         ttl,
+				TTL:         cm.HopLimit,
 				rcvdAt:      rcv,
 			}, nil
 		}
@@ -355,7 +329,7 @@ func send(ctx context.Context, conn *icmp.PacketConn, req *Request) (time.Time, 
 	default:
 		body := &icmp.Echo{
 			ID:   req.ID,
-			Seq:  int(req.Seq),
+			Seq:  req.Seq,
 			Data: req.data(),
 		}
 
@@ -367,9 +341,9 @@ func send(ctx context.Context, conn *icmp.PacketConn, req *Request) (time.Time, 
 
 		if req.proto() == protocolIPv4ICMP {
 			msg.Type = ipv4.ICMPTypeEcho
-			conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
+			conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL|ipv4.FlagSrc|ipv4.FlagDst, true)
 		} else {
-			conn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true)
+			conn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit|ipv6.FlagSrc|ipv6.FlagDst, true)
 		}
 
 		msgBytes, err := msg.Marshal(nil)

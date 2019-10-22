@@ -15,16 +15,16 @@ import (
 func TestE2E(t *testing.T) {
 	c := &ping.Client{}
 
-	hostIPs := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1"}
+	hostIPs := []string{"8.8.8.8", "8.8.4.4", "1.1.1.1", "10.10.10.10", "127.0.0.1"}
 	count := 3
 	deadline := time.Second * 5
 	timeout := time.Second * 2
 	interval := time.Second
 	pwg := &sync.WaitGroup{}
 
-	for _, hostIP := range hostIPs {
+	for xx, hostIP := range hostIPs {
 		pwg.Add(1)
-		go func(host string) {
+		go func(x int, host string) {
 			defer pwg.Done()
 
 			tick := time.NewTicker(interval)
@@ -48,10 +48,11 @@ func TestE2E(t *testing.T) {
 
 					packetsSent++
 					wg.Add(1)
-					go func(seq int) {
+					go func(id, seq int) {
 						defer wg.Done()
 						resp, err := c.Do(ctx, &ping.Request{
 							Dst: net.ParseIP(host),
+							ID:  id + 1,
 							Seq: seq,
 						})
 						if err != nil {
@@ -61,7 +62,7 @@ func TestE2E(t *testing.T) {
 
 						resps <- resp
 						onRcv(resp)
-					}(packetsSent)
+					}(x, packetsSent)
 				}
 			}
 
@@ -74,14 +75,14 @@ func TestE2E(t *testing.T) {
 			}
 			onFin(packetsSent, rsps)
 			fmt.Println()
-		}(hostIP)
+		}(xx, hostIP)
 	}
 	pwg.Wait()
 }
 
 func onRcv(res *ping.Response) {
 	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v\n",
-		res.TotalLength, res.Src.String(), res.Seq, res.RTT, res.TTL)
+		res.TotalLength, res.Req.Dst.String(), res.Seq, res.RTT, res.TTL)
 }
 
 func onFin(packetsSent int, resps []*ping.Response) {
@@ -111,7 +112,7 @@ func onFin(packetsSent int, resps []*ping.Response) {
 	}
 	stdDev := time.Duration(math.Sqrt(float64(sumsquares / time.Duration(len(resps)))))
 
-	fmt.Printf("\n--- %s ping statistics ---\n", resps[0].Src.String())
+	fmt.Printf("\n--- %s ping statistics ---\n", resps[0].Req.Dst.String())
 	fmt.Printf("%d packets transmitted, %d packets received, %.2f%% packet loss\n",
 		packetsSent, len(resps), float64(packetsSent-len(resps))/float64(packetsSent)*100)
 	fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n",
