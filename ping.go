@@ -224,7 +224,7 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, req *Request) (*Response,
 
 			// If there was no data read or the packet didn't originate from the host
 			// assumed, skip processing.
-			if n <= 0 || cm.Src.String() != req.Dst.String() {
+			if n <= 0 || (cm != nil && cm.Src.String() != req.Dst.String()) {
 				continue
 			}
 
@@ -248,16 +248,19 @@ func read4(ctx context.Context, conn *ipv4.PacketConn, req *Request) (*Response,
 
 			srcHost, _, _ := net.SplitHostPort(src.String())
 			dstHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
-			return &Response{
+			resp := &Response{
 				ID:          b.ID,
 				Seq:         uint(b.Seq),
 				Data:        b.Data,
 				TotalLength: n,
 				Src:         net.ParseIP(srcHost),
 				Dst:         net.ParseIP(dstHost),
-				TTL:         cm.TTL,
 				rcvdAt:      rcv,
-			}, nil
+			}
+			if cm != nil {
+				resp.TTL = cm.TTL
+			}
+			return resp, nil
 		}
 	}
 }
